@@ -37,7 +37,8 @@ class DatabaseManager:
         CREATE TABLE IF NOT EXISTS building_areas (
             name TEXT PRIMARY KEY,
             map_name TEXT,
-            layer INTEGER,
+            min_layer INTEGER,
+            max_layer INTEGER,
             position TEXT,
             type TEXT,
             size TEXT,
@@ -101,14 +102,15 @@ class DatabaseManager:
         self.execute(query, params)
         return self.cursor.fetchall()
     
-    def save_building_area(self, name, map_name, layer, position, type, corner, size_data=None):
+    def save_building_area(self, name, map_name, min_layer, max_layer, position, type, corner, size_data=None):
         """
         保存建筑区到数据库
         
         Args:
             name: 建筑区名称
             map_name: 地图名称
-            layer: 层索引
+            min_layer: 最小层索引
+            max_layer: 最大层索引
             position: 位置坐标
             type: 建筑区类型
             corner: 角点数据
@@ -137,9 +139,9 @@ class DatabaseManager:
             # 插入数据
             self.cursor.execute('''
             INSERT INTO building_areas
-            (name, map_name, layer, position, type, corner, size, area, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (name, map_name, layer, position_str, type, corner_str, size_str, area))
+            (name, map_name, min_layer, max_layer, position, type, corner, size, area, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (name, map_name, min_layer, max_layer, position_str, type, corner_str, size_str, area))
             
             self.conn.commit()
             print(f"建筑区 '{name}' 保存成功")
@@ -169,7 +171,7 @@ class DatabaseManager:
     
     def get_building_areas_by_layer(self, map_name, layer):
         """
-        获取同一层的所有建筑区
+        获取与指定层有交集的所有建筑区
         
         Args:
             map_name: 地图名称
@@ -180,13 +182,13 @@ class DatabaseManager:
         """
         try:
             self.cursor.execute('''
-            SELECT name, position, type, corner, size FROM building_areas 
-            WHERE map_name = ? AND layer = ?
-            ''', (map_name, layer))
+            SELECT name, position, type, corner, size, min_layer, max_layer FROM building_areas 
+            WHERE map_name = ? AND (min_layer <= ? AND max_layer >= ?)
+            ''', (map_name, layer, layer))
             
             result = []
             for row in self.cursor.fetchall():
-                name, position_str, type, corner_str, size_str = row
+                name, position_str, type, corner_str, size_str, min_layer, max_layer = row
                 
                 # 解析位置、角点和大小
                 try:
@@ -203,7 +205,9 @@ class DatabaseManager:
                         "name": name,
                         "type": type,
                         "position": position,
-                        "radius": radius
+                        "radius": radius,
+                        "min_layer": min_layer,
+                        "max_layer": max_layer
                     })
                 else:  # 矩形或其他形状
                     try:
@@ -221,7 +225,9 @@ class DatabaseManager:
                         "type": type,
                         "position": position,
                         "corner": corner,
-                        "size": size
+                        "size": size,
+                        "min_layer": min_layer,
+                        "max_layer": max_layer
                     })
             
             return result

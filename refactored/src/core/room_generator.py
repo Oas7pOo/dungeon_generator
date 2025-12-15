@@ -27,26 +27,28 @@ class RoomGenerator:
         """
         创建与重构前兼容的room表结构
         """
-        # 先删除旧表，重新创建以修改主键
+        # 先删除旧表，重新创建以修改主键和添加门字段
         self.db_manager.execute('''
         DROP TABLE IF EXISTS room
         ''')
-        # 创建room表，使用复合主键(name, map_name, layer_name)
+        # 创建room表，使用复合主键(name, map_name)，添加min_layer和max_layer字段
         self.db_manager.execute('''
         CREATE TABLE IF NOT EXISTS room (
             name TEXT,
             map_name TEXT,
-            layer_name TEXT,
+            min_layer INTEGER,
+            max_layer INTEGER,
             building_area TEXT,
             wall_grid_list TEXT,
             space_grid_list TEXT,
             inner_wall_grid_list TEXT,
+            door_grid_list TEXT,
             room_type TEXT,
             vector_params TEXT,
             other_params TEXT,
             area REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (name, map_name, layer_name)
+            PRIMARY KEY (name, map_name)
         )
         ''')
     
@@ -79,17 +81,18 @@ class RoomGenerator:
             # 使用时间戳作为备选方案
             return f"{prefix}_{int(time.time())}"
     
-    def generate_room_in_building(self, building_area, map_name, layer):
+    def generate_room_in_building(self, building_area, map_name, min_layer, max_layer):
         """
-        在建筑区内生成单个房间，与原来的代码结构保持一致
+        在建筑区内生成单个房间
         
         Args:
             building_area: 建筑区数据
             map_name: 地图名称
-            layer: 层级
+            min_layer: 最小层级
+            max_layer: 最大层级
             
         Returns:
-            生成的房间数据，符合重构前格式
+            生成的房间数据
         """
         try:
             building_name = building_area["name"]
@@ -101,21 +104,22 @@ class RoomGenerator:
             position = json.loads(position_str)
             
             if area_type == "circle":
-                return self._generate_circle_room(building_name, map_name, layer, position, corner_str)
+                return self._generate_circle_room(building_name, map_name, min_layer, max_layer, position, corner_str)
             else:
-                return self._generate_polygon_room(building_name, map_name, layer, position, corner_str)
+                return self._generate_polygon_room(building_name, map_name, min_layer, max_layer, position, corner_str)
         except Exception as e:
             print(f"在建筑区内生成房间时出错: {e}")
             return None
     
-    def _generate_circle_room(self, building_name, map_name, layer, position, corner_str):
+    def _generate_circle_room(self, building_name, map_name, min_layer, max_layer, position, corner_str):
         """
         在圆形建筑区内生成房间
         
         Args:
             building_name: 建筑区名称
             map_name: 地图名称
-            layer: 层级
+            min_layer: 最小层级
+            max_layer: 最大层级
             position: 建筑区中心位置
             corner_str: 圆形建筑区的半径
             
@@ -195,11 +199,12 @@ class RoomGenerator:
                 "height": radius * 2
             }
             
-            # 生成房间数据
+            # 生成房间数据，包含min_layer和max_layer
             room_data = {
                 "name": room_name,
                 "map_name": map_name,
-                "layer_name": str(layer),
+                "min_layer": min_layer,
+                "max_layer": max_layer,
                 "building_area": building_name,
                 "wall_grid_list": json.dumps(wall_grid_list),
                 "space_grid_list": json.dumps(space_grid_list),
@@ -210,19 +215,23 @@ class RoomGenerator:
                 "area": area
             }
             
+            # 生成门
+            room_data = self.generate_doors(room_data)
+            
             return room_data
         except Exception as e:
             print(f"生成圆形房间时出错: {e}")
             return None
     
-    def _generate_polygon_room(self, building_name, map_name, layer, position, corner_str):
+    def _generate_polygon_room(self, building_name, map_name, min_layer, max_layer, position, corner_str):
         """
         在多边形建筑区内生成房间
         
         Args:
             building_name: 建筑区名称
             map_name: 地图名称
-            layer: 层级
+            min_layer: 最小层级
+            max_layer: 最大层级
             position: 建筑区中心位置
             corner_str: 建筑区的角点数据
             
@@ -316,11 +325,12 @@ class RoomGenerator:
                 "height": max_y - min_y
             }
             
-            # 生成房间数据
+            # 生成房间数据，包含min_layer和max_layer
             room_data = {
                 "name": room_name,
                 "map_name": map_name,
-                "layer_name": str(layer),
+                "min_layer": min_layer,
+                "max_layer": max_layer,
                 "building_area": building_name,
                 "wall_grid_list": json.dumps(wall_grid_list),
                 "space_grid_list": json.dumps(space_grid_list),
@@ -331,6 +341,9 @@ class RoomGenerator:
                 "area": area
             }
             
+            # 生成门
+            room_data = self.generate_doors(room_data)
+            
             return room_data
         except Exception as e:
             print(f"生成多边形房间时出错: {e}")
@@ -338,10 +351,10 @@ class RoomGenerator:
     
     def save_room(self, room_data):
         """
-        保存房间数据到数据库（使用与重构前兼容的room表）
+        保存房间数据到数据库
         
         Args:
-            room_data: 符合重构前格式的房间数据
+            room_data: 包含min_layer和max_layer的房间数据
             
         Returns:
             成功返回True，失败返回False
@@ -350,10 +363,10 @@ class RoomGenerator:
             return False
         
         try:
-            # 检查房间是否已存在，使用(name, map_name, layer_name)的组合作为唯一标识
+            # 检查房间是否已存在，使用(name, map_name)的组合作为唯一标识
             existing = self.db_manager.fetch_one(
-                "SELECT name FROM room WHERE name = ? AND map_name = ? AND layer_name = ?",
-                (room_data["name"], room_data["map_name"], room_data["layer_name"])
+                "SELECT name FROM room WHERE name = ? AND map_name = ?",
+                (room_data["name"], room_data["map_name"])
             )
             
             if existing:
@@ -362,18 +375,20 @@ class RoomGenerator:
             # 保存到数据库
             self.db_manager.execute('''
             INSERT INTO room (
-                name, map_name, layer_name, building_area, wall_grid_list, 
-                space_grid_list, inner_wall_grid_list, room_type, vector_params, 
+                name, map_name, min_layer, max_layer, building_area, wall_grid_list, 
+                space_grid_list, inner_wall_grid_list, door_grid_list, room_type, vector_params, 
                 other_params, area
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 room_data["name"],
                 room_data["map_name"],
-                room_data["layer_name"],
+                room_data["min_layer"],
+                room_data["max_layer"],
                 room_data["building_area"],
                 room_data["wall_grid_list"],
                 room_data["space_grid_list"],
                 room_data["inner_wall_grid_list"],
+                room_data.get("door_grid_list", "[]"),
                 room_data["room_type"],
                 room_data["vector_params"],
                 room_data["other_params"],
@@ -386,6 +401,22 @@ class RoomGenerator:
             import traceback
             traceback.print_exc()
             return False
+    
+    def generate_doors(self, room_data):
+        """
+        门生成功能已迁移到ItemGenerator类
+        此方法保留为兼容旧代码
+        
+        Args:
+            room_data: 房间数据
+            
+        Returns:
+            更新后的房间数据，包含空的门信息
+        """
+        import json
+        # 默认返回空的门格子列表
+        room_data["door_grid_list"] = json.dumps([])
+        return room_data
     
     def maze_room(self, room_name, maze_width=1, complexity=0.5):
         """
@@ -444,6 +475,8 @@ class RoomGenerator:
                     else:
                         grid[(x, y)] = -1  # 不在房间内的格子
             
+            # 迷宫代码使用坐标(行,列)而不是(x,y)
+            # 创建一个稀疏网格，只包含房间内的单元格
             # 找出所有可能的迷宫单元格（每隔一格）
             maze_cells = []
             for y in range(min_y, max_y + 1, 2):
@@ -524,13 +557,12 @@ class RoomGenerator:
             print(f"创建的内墙数量: {len(inner_wall_grid_list)}")
             print(f"通道数量: {sum(1 for v in grid.values() if v == 1)}")
             
-            # 更新数据库
-            inner_wall_grid_str = json.dumps(inner_wall_grid_list)
+            # 更新数据库，保留原有的door_grid_list
             self.db_manager.execute('''
                 UPDATE room 
                 SET inner_wall_grid_list = ?
                 WHERE name = ?
-            ''', (inner_wall_grid_str, room_name))
+            ''', (json.dumps(inner_wall_grid_list), room_name))
             
             print(f"房间 '{room_name}' 迷宫生成成功，内墙数量: {len(inner_wall_grid_list)}")
             return True
@@ -543,7 +575,7 @@ class RoomGenerator:
     
     def generate_and_save_rooms(self, map_name):
         """
-        为所有建筑区生成并保存房间，与原来的generate_rooms方法保持一致
+        为所有建筑区生成并保存房间
         
         Args:
             map_name: 地图名称
@@ -551,16 +583,16 @@ class RoomGenerator:
         Returns:
             成功生成的房间数量
         """
-        # 获取所有建筑区
+        # 获取所有建筑区，包含min_layer和max_layer
         building_areas = self.db_manager.fetch_all(
-            "SELECT name, position, type, corner, layer FROM building_areas WHERE map_name = ?",
+            "SELECT name, position, type, corner, min_layer, max_layer FROM building_areas WHERE map_name = ?",
             (map_name,)
         )
         
         success_count = 0
         
         for area in building_areas:
-            name, position_str, area_type, corner_str, layer = area
+            name, position_str, area_type, corner_str, min_layer, max_layer = area
             
             # 构造建筑区数据
             building_area = {
@@ -570,15 +602,33 @@ class RoomGenerator:
                 "corner": corner_str
             }
             
-            # 生成房间
-            room_data = self.generate_room_in_building(building_area, map_name, layer)
-            
-            if room_data and self.save_room(room_data):
-                success_count += 1
-                print(f"✅ 为 {name}（层 {layer}）生成了房间")
+            # 根据建筑区类型决定房间生成策略
+            if "三层圆塔" in name:
+                # 圆塔生成贯穿所有层的房间
+                room_data = self.generate_room_in_building(building_area, map_name, min_layer, max_layer)
                 
-                # 对于旋转矩形房间的层1，生成迷宫
-                if "旋转矩形房间" in name and layer == 1:
-                    self.maze_room(room_data["name"], maze_width=1, complexity=0.5)
+                if room_data and self.save_room(room_data):
+                    success_count += 1
+                    print(f"✅ 为 {name}（层 {min_layer} 到 {max_layer}）生成了房间")
+            elif "旋转矩形房间" in name:
+                # 旋转矩形房间为每个层生成独立房间
+                for layer in range(min_layer, max_layer + 1):
+                    # 生成房间，只使用当前层
+                    room_data = self.generate_room_in_building(building_area, map_name, layer, layer)
+                    
+                    if room_data and self.save_room(room_data):
+                        success_count += 1
+                        print(f"✅ 为 {name}（层 {layer}）生成了房间")
+                        
+                        # 对于旋转矩形房间的层1，生成迷宫
+                        if layer == 1:
+                            self.maze_room(room_data["name"], maze_width=1, complexity=0.5)
+            else:
+                # 其他建筑区默认生成贯穿所有层的房间
+                room_data = self.generate_room_in_building(building_area, map_name, min_layer, max_layer)
+                
+                if room_data and self.save_room(room_data):
+                    success_count += 1
+                    print(f"✅ 为 {name}（层 {min_layer} 到 {max_layer}）生成了房间")
         
         return success_count

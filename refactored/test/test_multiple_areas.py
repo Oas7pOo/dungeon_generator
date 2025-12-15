@@ -8,14 +8,36 @@
 import sys
 import os
 
-# 将src目录添加到Python路径
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+# 将项目根目录添加到Python路径
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src import RectangleBuildingAreaGenerator, DatabaseManager, MapVisualizer
 
 def test_multiple_rectangles():
     """
     测试生成100个不旋转的矩形建筑区
+    类型：大量矩形建筑区压力测试
+    参数：
+    - 建筑区类型：不旋转矩形
+    - 数量：100个
+    - 尺寸范围：(5, 3) 到 (50, 30)
+    - 层数：1层
+    - 旋转：False
+    - 分布：指数分布
+    - 最大尝试次数：150
+    - 地图：
+        - 名称：小面积地图
+        - 尺寸：100x100
+    数量：100个不旋转矩形建筑区
+    测试目标：
+    1. 验证在小面积地图上生成大量矩形建筑区的效率
+    2. 验证指数分布在建筑区生成中的应用
+    3. 验证大量建筑区生成的成功率
+    4. 验证大量建筑区的可视化效果
+    生成内容：
+    1. 数据库中创建100个不旋转矩形建筑区记录
+    2. 在multiple_areas_output目录下生成包含所有建筑区的PNG和PDF文件
+    3. 自动打开生成的PDF文件
     """
     print("=== 测试生成100个不旋转的矩形建筑区 ===")
     
@@ -86,30 +108,28 @@ def test_multiple_rectangles():
         try:
             visualizer = MapVisualizer(db_manager)
             
-            # 绘制地图
-            fig = visualizer.draw_map(map_name, layer_index=1, show_grid=True, 
-                                     show_building_areas=True, show_area_names=False, 
-                                     fig_size=(15, 15))
+            # 保存组合PDF，按照物品层->房间层->建筑区层的顺序
+            output_dir = os.path.join(os.path.dirname(__file__), "output")
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"保存地图到 {output_dir} 目录...")
+            combined_pdf_path = visualizer.save_combined_pdf(
+                map_name, 
+                layers=[1],  # 只有1层
+                show_grid=True, 
+                show_building_areas=True, 
+                show_area_names=False, 
+                show_rooms=False,  # 没有生成房间，所以不显示
+                fig_size=(15, 15),
+                output_dir=output_dir,
+                filename="test_multiple_areas"  # 指定文件名与程序名对应
+            )
+            print(f"✅ 成功保存组合PDF到: {combined_pdf_path}")
             
-            if fig:
-                # 保存地图
-                output_dir = "multiple_areas_output"
-                print(f"保存地图到 {output_dir} 目录...")
-                visualizer.save_map(
-                    fig, 
-                    f"{map_name}_{success_count}个建筑区", 
-                    formats=['png', 'pdf'],
-                    output_dir=output_dir
-                )
-                print("✅ 成功保存地图")
-                
-                # 打开生成的PDF文件
-                import os
+            # 打开生成的PDF文件
+            if os.path.exists(combined_pdf_path):
+                print(f"正在打开PDF文件: {combined_pdf_path}")
                 import subprocess
-                pdf_path = os.path.join(output_dir, f"{map_name}_{success_count}个建筑区.pdf")
-                if os.path.exists(pdf_path):
-                    print(f"正在打开PDF文件: {pdf_path}")
-                    subprocess.Popen([pdf_path], shell=True)
+                subprocess.Popen([combined_pdf_path], shell=True)
             
             visualizer.close()
             

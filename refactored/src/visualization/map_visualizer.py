@@ -148,10 +148,10 @@ class MapVisualizer:
             area_color: 建筑区颜色
             show_area_names: 是否显示建筑区名称
         """
-        # 获取建筑区数据
+        # 获取建筑区数据，查找与指定层有交集的建筑区
         building_areas = self.db_manager.fetch_all(
-            "SELECT name, position, type, corner, size FROM building_areas WHERE map_name = ? AND layer = ?",
-            (map_name, layer_index)
+            "SELECT name, position, type, corner, size FROM building_areas WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?",
+            (map_name, layer_index, layer_index)
         )
         
         import json
@@ -216,21 +216,13 @@ class MapVisualizer:
             room_inner_color: 房间内部颜色
             room_inner_wall_color: 房间内墙颜色
         """
-        # 使用与重构前相同的查询语句，获取符合条件的房间数据
+        # 更新查询语句，使用min_layer和max_layer字段
         query = '''
-        SELECT name, wall_grid_list, space_grid_list, inner_wall_grid_list, vector_params, layer_name 
+        SELECT name, wall_grid_list, space_grid_list, inner_wall_grid_list, door_grid_list, vector_params 
         FROM room 
-        WHERE map_name = ? AND (
-            layer_name = ? OR 
-            layer_name LIKE ? OR 
-            layer_name LIKE ? OR 
-            layer_name LIKE ? OR
-            (json_extract(vector_params, '$.is_multi_layer') = 1 AND 
-             json_extract(vector_params, '$.min_layer') <= ? AND 
-             json_extract(vector_params, '$.max_layer') >= ?)
-        )
+        WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?
         '''
-        params = (map_name, str(layer_index), f"{layer_index}-%", f"%-{layer_index}", f"%-{layer_index}-%", layer_index, layer_index)
+        params = (map_name, layer_index, layer_index)
         
         rooms = self.db_manager.fetch_all(query, params)
         
@@ -271,6 +263,18 @@ class MapVisualizer:
                 )
                 ax.add_patch(rect)
         
+        # 定义绘制房间门格子的辅助函数，确保与地图格子对齐
+        def draw_room_door_grids(ax, door_grid_list, color):
+            for x, y in door_grid_list:
+                rect = patches.Rectangle(
+                    (x, y), 1, 1,  # 直接使用(x, y)作为左下角坐标，确保与地图格子对齐
+                    facecolor=color,
+                    edgecolor='black',
+                    linewidth=0.5,
+                    zorder=5.5  # 门应该显示在矢量图之上
+                )
+                ax.add_patch(rect)
+        
         # 定义绘制房间矢量轮廓的辅助函数
         def draw_room_vector_outline(ax, vector_params, color):
             import math
@@ -286,7 +290,7 @@ class MapVisualizer:
                         facecolor=color,
                         edgecolor='blue',
                         linewidth=1.5,
-                        zorder=1
+                        zorder=4.5  # 矢量图显示在房间方块上层，门的下层
                     )
                     ax.add_patch(circle)
                     return center
@@ -307,7 +311,7 @@ class MapVisualizer:
                     facecolor=color,
                     edgecolor='blue',
                     linewidth=1.5,
-                    zorder=1
+                    zorder=4.5  # 矢量图显示在房间方块上层，门的下层
                 )
                 ax.add_patch(poly)
                 return center
@@ -346,7 +350,7 @@ class MapVisualizer:
                     facecolor=color,
                     edgecolor='blue',
                     linewidth=1.5,
-                    zorder=1
+                    zorder=4.5  # 矢量图显示在房间方块上层，门的下层
                 )
                 ax.add_patch(poly)
                 return center
@@ -364,13 +368,14 @@ class MapVisualizer:
         
         # 处理每个房间
         for room in rooms:
-            name, wall_grid_str, space_grid_str, inner_wall_grid_str, vector_params_str, layer_name = room
+            name, wall_grid_str, space_grid_str, inner_wall_grid_str, door_grid_str, vector_params_str = room
             
             try:
                 # 解析JSON数据
                 wall_grid_list = json.loads(wall_grid_str)
                 space_grid_list = json.loads(space_grid_str)
                 inner_wall_grid_list = json.loads(inner_wall_grid_str) if inner_wall_grid_str else []
+                door_grid_list = json.loads(door_grid_str) if door_grid_str else []
                 vector_params = json.loads(vector_params_str)
                 
                 # 使用与重构前相同的颜色配置
@@ -378,6 +383,7 @@ class MapVisualizer:
                     '内部颜色': (0.8, 0.8, 0.8, 1.0),  # 不透明浅灰色
                     '外墙颜色': (0.3, 0.3, 0.3, 1.0),  # 不透明深灰色
                     '内墙颜色': (0.7, 0.2, 0.2, 0.8),  # 不透明红棕色
+                    '门颜色': (1.0, 1.0, 0.0, 1.0),    # 不透明黄色，用于门的渲染
                     '矢量颜色': (0.4, 0.4, 1.0, 0.3)   # 半透明蓝色
                 }
                 
@@ -390,10 +396,13 @@ class MapVisualizer:
                 # 3. 绘制房间内墙格子
                 draw_room_inner_wall_grids(ax, inner_wall_grid_list, color_config['内墙颜色'])
                 
-                # 4. 绘制房间矢量轮廓
+                # 4. 绘制房间矢量轮廓，提高zorder使其显示在房间方块上层
                 center = draw_room_vector_outline(ax, vector_params, color_config['矢量颜色'])
                 
-                # 5. 添加房间名称
+                # 5. 绘制房间门格子，提高zorder使其显示在矢量图上层
+                draw_room_door_grids(ax, door_grid_list, color_config['门颜色'])
+                
+                # 6. 添加房间名称
                 add_room_name(ax, center, name)
                 
             except Exception as e:
@@ -442,9 +451,9 @@ class MapVisualizer:
         """
         # 获取地图的所有层级
         if layers is None:
-            # 假设每个建筑区的layer字段表示层级，获取最大值
+            # 使用max_layer字段获取最大层级
             max_layer = self.db_manager.fetch_one(
-                "SELECT MAX(layer) FROM building_areas WHERE map_name = ?",
+                "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
                 (map_name,)
             )
             max_layer = max_layer[0] if max_layer and max_layer[0] else 3  # 默认3层
@@ -483,9 +492,9 @@ class MapVisualizer:
         
         # 获取地图的所有层级
         if layers is None:
-            # 假设每个建筑区的layer字段表示层级，获取最大值
+            # 使用max_layer字段获取最大层级
             max_layer = self.db_manager.fetch_one(
-                "SELECT MAX(layer) FROM building_areas WHERE map_name = ?",
+                "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
                 (map_name,)
             )
             max_layer = max_layer[0] if max_layer and max_layer[0] else 3  # 默认3层
@@ -518,6 +527,125 @@ class MapVisualizer:
         print(f"✅ 成功保存多层PDF到: {pdf_path}")
         return pdf_path
     
+    def save_combined_pdf(self, map_name, layers=None, output_dir="地图输出", 
+                           fig_size=(10, 10), show_building_areas=True, 
+                           show_rooms=True, show_grid=True, show_area_names=True, filename=None):
+        """
+        将多个层级的地图保存到一个PDF文件中，按照物品层 -> 房间层 -> 建筑区层的顺序，每页一层
+        
+        Args:
+            map_name: 地图名称
+            layers: 层级列表，默认为所有层级
+            output_dir: 输出目录
+            fig_size: 图像尺寸
+            show_building_areas: 是否显示建筑区
+            show_rooms: 是否显示房间
+            show_grid: 是否显示网格
+            show_area_names: 是否显示建筑区名称
+            filename: 自定义文件名，默认使用map_name
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        
+        # 获取地图的所有层级
+        if layers is None:
+            # 使用max_layer字段获取最大层级
+            max_layer = self.db_manager.fetch_one(
+                "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
+                (map_name,)
+            )
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3  # 默认3层
+            layers = range(1, max_layer + 1)
+        
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 创建PDF文件，确保文件名没有空格
+        if filename:
+            # 使用自定义文件名
+            safe_filename = filename.replace(" ", "_")
+        else:
+            # 使用map_name作为文件名
+            safe_filename = map_name.replace(" ", "_")
+        
+        pdf_path = os.path.join(output_dir, f"{safe_filename}.pdf")
+        
+        with PdfPages(pdf_path) as pdf:
+            # 1. 物品层：显示建筑区 + 房间 + 物品（门）
+            print(f"\n生成物品层（带门）...")
+            for layer in layers:
+                # 绘制地图，显示所有元素（建筑区、房间、物品）
+                fig = self.draw_map(
+                    map_name, 
+                    layer, 
+                    show_grid=show_grid, 
+                    show_building_areas=show_building_areas, 
+                    show_area_names=show_area_names, 
+                    show_rooms=show_rooms,  # 显示房间，包含门
+                    fig_size=fig_size
+                )
+                if fig:
+                    # 修改标题，明确显示这是物品层
+                    if self.chinese_font:
+                        plt.title(f"{map_name} - 层级 {layer}（物品层）", fontproperties=self.chinese_font)
+                    else:
+                        plt.title(f"{map_name} - 层级 {layer}（物品层）")
+                    # 添加到PDF
+                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
+                    # 关闭图表，释放资源
+                    plt.close(fig)
+            
+            # 2. 房间层：显示建筑区 + 房间（不带物品）
+            print(f"\n生成房间层（带房间区）...")
+            for layer in layers:
+                # 绘制地图，显示建筑区和房间，但隐藏物品（门）
+                fig = self.draw_map(
+                    map_name, 
+                    layer, 
+                    show_grid=show_grid, 
+                    show_building_areas=show_building_areas, 
+                    show_area_names=show_area_names, 
+                    show_rooms=show_rooms,  # 显示房间，但不单独突出物品
+                    fig_size=fig_size
+                )
+                if fig:
+                    # 修改标题，明确显示这是房间层
+                    if self.chinese_font:
+                        plt.title(f"{map_name} - 层级 {layer}（房间层）", fontproperties=self.chinese_font)
+                    else:
+                        plt.title(f"{map_name} - 层级 {layer}（房间层）")
+                    # 添加到PDF
+                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
+                    # 关闭图表，释放资源
+                    plt.close(fig)
+            
+            # 3. 建筑区层：只显示建筑区
+            print(f"\n生成建筑区层（仅建筑区）...")
+            for layer in layers:
+                # 绘制地图，只显示建筑区
+                fig = self.draw_map(
+                    map_name, 
+                    layer, 
+                    show_grid=show_grid, 
+                    show_building_areas=show_building_areas, 
+                    show_area_names=show_area_names, 
+                    show_rooms=False,  # 不显示房间和物品
+                    fig_size=fig_size
+                )
+                if fig:
+                    # 修改标题，明确显示这是建筑区层
+                    if self.chinese_font:
+                        plt.title(f"{map_name} - 层级 {layer}（建筑区层）", fontproperties=self.chinese_font)
+                    else:
+                        plt.title(f"{map_name} - 层级 {layer}（建筑区层）")
+                    # 添加到PDF
+                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
+                    # 关闭图表，释放资源
+                    plt.close(fig)
+        
+        print(f"✅ 成功保存组合PDF到: {pdf_path}")
+        return pdf_path
+
     def close(self):
         """
         关闭数据库连接
