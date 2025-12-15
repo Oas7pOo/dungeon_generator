@@ -63,9 +63,9 @@ class BuildingAreaGenerator(ABC):
         # 将输入转换为Shapely对象
         if shape_type == "circle":
             center, radius = shape
-            check_shape = Point(center).buffer(radius + distance)  # 圆形膨胀
+            check_shape = Point(center).buffer(radius)  # 圆形不膨胀
         else:
-            check_shape = Polygon(shape).buffer(distance)  # 多边形膨胀
+            check_shape = Polygon(shape)  # 多边形不膨胀
         
         # 获取同层建筑区
         building_areas = self.get_building_areas_by_layer(layer)
@@ -78,12 +78,14 @@ class BuildingAreaGenerator(ABC):
             if area["type"] == "circle":
                 center = area["position"]
                 radius = area["radius"]
-                other_shape = Point(center).buffer(radius + distance)  # 现有圆形也膨胀
+                # 只膨胀现有圆形，确保最小间距为distance
+                other_shape = Point(center).buffer(radius + distance)
             else:
                 polygon_vertices = area["corner"]
                 if not polygon_vertices or not isinstance(polygon_vertices, list) or len(polygon_vertices) < 3:
                     continue
-                other_shape = Polygon(polygon_vertices).buffer(distance)  # 现有多边形也膨胀
+                # 只膨胀现有多边形，确保最小间距为distance
+                other_shape = Polygon(polygon_vertices).buffer(distance)
                 
             if check_shape.intersects(other_shape):
                 return True
@@ -141,11 +143,11 @@ class BuildingAreaGenerator(ABC):
         layer_to_process = layer if layer is not None else self.layer
         
         if isinstance(layer_to_process, tuple) and len(layer_to_process) == 2:
-            # 处理层范围 - 表示一个跨层建筑
-            min_layer, max_layer = layer_to_process
-            is_multi_layer = min_layer != max_layer
-            self.layer = min_layer  # 使用最小层作为主层
-            layer_list = [min_layer] if is_multi_layer else list(range(min_layer, max_layer + 1))
+                # 处理层范围 - 表示一个跨层建筑
+                min_layer, max_layer = layer_to_process
+                is_multi_layer = min_layer != max_layer
+                self.layer = min_layer  # 使用最小层作为主层
+                layer_list = list(range(min_layer, max_layer + 1)) if is_multi_layer else [min_layer]
         elif isinstance(layer_to_process, int):
             # 单个层
             layer_list = [layer_to_process]
@@ -325,16 +327,16 @@ class BuildingAreaGenerator(ABC):
         Returns:
             同层建筑区列表
         """
-        # 从数据库获取同层建筑区
+        # 从数据库获取与指定层有交集的所有建筑区
         building_areas = self.db_manager.fetch_all(
-            "SELECT name, map_name, layer, position, type, corner, size FROM building_areas WHERE layer = ? AND map_name = ?",
-            (layer_index, self.map_name)
+            "SELECT name, map_name, min_layer, max_layer, position, type, corner, size FROM building_areas WHERE map_name = ? AND (min_layer <= ? AND max_layer >= ?)",
+            (self.map_name, layer_index, layer_index)
         )
         
         # 转换为便于处理的格式
         result = []
         for area in building_areas:
-            name, map_name, layer, position_str, area_type, corner_str, size_str = area
+            name, map_name, min_layer, max_layer, position_str, area_type, corner_str, size_str = area
             
             try:
                 # 解析位置
@@ -359,7 +361,8 @@ class BuildingAreaGenerator(ABC):
                     result.append({
                         "name": name,
                         "map_name": map_name,
-                        "layer": layer,
+                        "min_layer": min_layer,
+                        "max_layer": max_layer,
                         "position": position,
                         "type": area_type,
                         "radius": radius,
@@ -376,7 +379,8 @@ class BuildingAreaGenerator(ABC):
                     result.append({
                         "name": name,
                         "map_name": map_name,
-                        "layer": layer,
+                        "min_layer": min_layer,
+                        "max_layer": max_layer,
                         "position": position,
                         "type": area_type,
                         "corner": corners,
@@ -602,69 +606,78 @@ class RectangleBuildingAreaGenerator(BuildingAreaGenerator):
 
         min_size, max_size = rect_size
         
-        # 阶段1: 尝试随机放置
-        print(f"阶段1: 尝试随机放置...")
-        for attempt in range(max_attempts):
-            # 生成矩形尺寸：根据分布类型和规整程度生成宽高
+        # 阶段1: 尝试从大到小随机放置，每个尺寸多次尝试
+        print("阶段1: 尝试从大到小随机放置，每个尺寸多次尝试...")
+        tries_per_size = 50  # 每个尺寸尝试次数
+        
+        # 生成多个尺寸，按面积从大到小排序
+        sizes_to_try = []
+        for _ in range(max_attempts):
             width, height = self.generate_room_size(min_size, max_size, dist, regular_rect=regular_rect)
-            
+            sizes_to_try.append((width * height, width, height))
+        
+        # 按面积从大到小排序，优先尝试较大的尺寸
+        sizes_to_try.sort(reverse=True, key=lambda x: x[0])
+        
+        # 尝试每个尺寸，每个尺寸多次尝试
+        for area, width, height in sizes_to_try:
             # 检查尺寸是否超出地图范围
             if map_width - width < 0 or map_height - height < 0:
                 continue
-                
-            # 随机选择左上角位置
-            left = np.random.randint(0, map_width - width + 1)
-            top = np.random.randint(0, map_height - height + 1)
             
-            # 计算矩形四个顶点坐标（左上、右上、右下、左下，顺时针方向）
-            vertices = [
-                (left, top),  # 左上顶点
-                (left + width, top),  # 右上顶点
-                (left + width, top + height),  # 右下顶点
-                (left, top + height),  # 左下顶点
-            ]
-            
-            # 计算矩形中心点坐标
-            center_x = left + width / 2
-            center_y = top + height / 2
-            
-            # 检查矩形是否与现有建筑区重叠（考虑跨层情况和最小距离）
-            is_overlap = self.check_multi_layer_overlap(vertices, "polygon", min_layer, max_layer, distance)
-            if not is_overlap:
-                # 没有重叠，找到了合适的位置，保存并返回结果
-                print(f"✅ 随机放置成功，尺寸: {width}x{height}")
-                return self._save_rectangle(full_name, is_multi_layer, min_layer, max_layer, center_x, center_y, width, height, vertices)
-        
-        # 阶段2: 尝试从大到小填充模式
-        if placement_mode == "largest_first":
-            print("切换到从大到小填充模式...")
-            
-            # 生成多个尺寸，按面积从大到小排序
-            sizes_to_try = []
-            for attempt in range(max_attempts):
-                width, height = self.generate_room_size(min_size, max_size, dist, regular_rect=regular_rect)
-                # 保存面积、宽度、高度的元组
-                sizes_to_try.append((width * height, width, height))
-            
-            # 按面积从大到小排序，优先尝试较大的尺寸
-            sizes_to_try.sort(reverse=True, key=lambda x: x[0])
-            
-            # 尝试每个尺寸
-            for area, width, height in sizes_to_try:
-                # 检查尺寸是否超出地图范围
-                if map_width - width < 0 or map_height - height < 0:
-                    continue
-                    
+            # 对当前尺寸尝试多次放置
+            for _ in range(tries_per_size):
                 # 随机选择左上角位置
                 left = np.random.randint(0, map_width - width + 1)
                 top = np.random.randint(0, map_height - height + 1)
                 
                 # 计算矩形四个顶点坐标
                 vertices = [
-                    (left, top),  # 左上
-                    (left + width, top),  # 右上
-                    (left + width, top + height),  # 右下
-                    (left, top + height),  # 左下
+                    (left, top),
+                    (left + width, top),
+                    (left + width, top + height),
+                    (left, top + height),
+                ]
+                
+                # 计算矩形中心点坐标
+                center_x = left + width / 2
+                center_y = top + height / 2
+                
+                # 检查矩形是否与现有建筑区重叠（考虑跨层情况和最小距离）
+                is_overlap = self.check_multi_layer_overlap(vertices, "polygon", min_layer, max_layer, distance)
+                if not is_overlap:
+                    # 没有重叠，找到了合适的位置，保存并返回结果
+                    print(f"✅ 从大到小随机放置成功，尺寸: {width}x{height}")
+                    return self._save_rectangle(full_name, is_multi_layer, min_layer, max_layer, center_x, center_y, width, height, vertices)
+        
+        # 阶段2: 使用calculate_free_areas寻找最佳放置位置
+        print("阶段2: 使用calculate_free_areas寻找最佳放置位置...")
+        free_bounds = self.calculate_free_areas(min_layer, map_width, map_height, distance)
+        if free_bounds is not None:
+            fb_minx, fb_miny, fb_maxx, fb_maxy = free_bounds
+            # 计算空闲区域的宽度和高度
+            fb_width = fb_maxx - fb_minx
+            fb_height = fb_maxy - fb_maxy
+            
+            # 生成适合空闲区域的尺寸，尝试放置
+            for _ in range(max_attempts):
+                # 生成尺寸，根据分布类型和规整程度
+                width, height = self.generate_room_size(min_size, max_size, dist, regular_rect=regular_rect)
+                
+                # 确保尺寸适合空闲区域
+                if width > fb_width or height > fb_height:
+                    continue
+                
+                # 在空闲区域内随机选择位置
+                left = np.random.randint(int(fb_minx), int(fb_maxx - width + 1))
+                top = np.random.randint(int(fb_miny), int(fb_maxy - height + 1))
+                
+                # 计算矩形四个顶点坐标
+                vertices = [
+                    (left, top),
+                    (left + width, top),
+                    (left + width, top + height),
+                    (left, top + height),
                 ]
                 
                 # 计算矩形中心点坐标
@@ -675,12 +688,12 @@ class RectangleBuildingAreaGenerator(BuildingAreaGenerator):
                 is_overlap = self.check_multi_layer_overlap(vertices, "polygon", min_layer, max_layer, distance)
                 if not is_overlap:
                     # 没有重叠，找到了合适的位置，保存并返回结果
-                    print(f"✅ 从大到小放置成功，尺寸: {width}x{height}")
+                    print(f"✅ 基于空闲区域放置成功，尺寸: {width}x{height}")
                     return self._save_rectangle(full_name, is_multi_layer, min_layer, max_layer, center_x, center_y, width, height, vertices)
         
-        # 阶段3: 尝试同比缩小尺寸（如果启用resize选项）
-        if enable_resize:
-            print(f"阶段3: 尝试同比缩小尺寸...")
+        # 阶段3: 尝试同比缩小尺寸（仅当地图尺寸 <= 100x100 时启用）
+        if enable_resize and map_width <= 100 and map_height <= 100:
+            print(f"阶段3: 尝试同比缩小尺寸（地图尺寸 {map_width}x{map_height} <= 100x100，启用暴力扫描）...")
             
             # 生成基础尺寸
             base_width, base_height = self.generate_room_size(min_size, max_size, dist)
