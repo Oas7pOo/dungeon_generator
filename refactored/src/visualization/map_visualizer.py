@@ -1,653 +1,631 @@
 import os
+import json
+import platform
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import matplotlib.colors as mcolors
 from matplotlib.font_manager import FontProperties
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.colors import ListedColormap
+
 from ..db.database import DatabaseManager
+
 
 class MapVisualizer:
     """
-    地图可视化管理器，负责生成和保存地图图像
+    地图可视化管理器（高性能版）
+    - 房间/墙/门/内墙：使用 imshow + 掩码（mask）渲染，避免逐格 Rectangle
+    - 提供 5 个渲染层：building_areas / room_grid / room_vector / item_grid / item_vector
+    - 允许用户控制：每层是否显示 + 叠放顺序
     """
-    
+
+    # 5 个层的 key（你在参数里用这些字符串）
+    L_BUILDING = "building_areas"
+    L_ROOM_GRID = "room_grid"
+    L_ROOM_VECTOR = "room_vector"
+    L_ITEM_GRID = "item_grid"
+    L_ITEM_VECTOR = "item_vector"
+
+    ALL_LAYERS = (L_BUILDING, L_ROOM_GRID, L_ROOM_VECTOR, L_ITEM_GRID, L_ITEM_VECTOR)
+
     def __init__(self, db_manager=None):
-        """
-        初始化地图可视化管理器
-        
-        Args:
-            db_manager: 数据库管理器实例
-        """
         self.db_manager = db_manager or DatabaseManager()
         self._setup_chinese_font()
-    
+
+    # ---------------- font ----------------
+
     def _setup_chinese_font(self):
-        """
-        设置中文字体支持
-        """
-        # 设置中文字体
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'KaiTi', 'FangSong', 'Arial Unicode MS', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-        
-        # 根据操作系统选择合适的中文字体
-        import platform
+        plt.rcParams["font.sans-serif"] = [
+            "SimHei", "Microsoft YaHei", "SimSun", "KaiTi", "FangSong",
+            "Arial Unicode MS", "DejaVu Sans"
+        ]
+        plt.rcParams["axes.unicode_minus"] = False
+
         system = platform.system()
-        if system == 'Windows':
-            plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei'] + plt.rcParams['font.sans-serif']
-        elif system == 'Darwin':  # macOS
-            plt.rcParams['font.sans-serif'] = ['PingFang SC', 'STHeiti'] + plt.rcParams['font.sans-serif']
-        elif system == 'Linux':
-            plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei'] + plt.rcParams['font.sans-serif']
-        
-        # 创建一个通用的中文字体对象
+        if system == "Windows":
+            plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"] + plt.rcParams["font.sans-serif"]
+        elif system == "Darwin":
+            plt.rcParams["font.sans-serif"] = ["PingFang SC", "STHeiti"] + plt.rcParams["font.sans-serif"]
+        elif system == "Linux":
+            plt.rcParams["font.sans-serif"] = ["WenQuanYi Micro Hei", "WenQuanYi Zen Hei"] + plt.rcParams["font.sans-serif"]
+
         try:
-            self.chinese_font = FontProperties(family=plt.rcParams['font.sans-serif'][0])
+            self.chinese_font = FontProperties(family=plt.rcParams["font.sans-serif"][0])
         except Exception as e:
             print(f"警告: 无法加载默认中文字体，文本可能无法正确显示: {e}")
             self.chinese_font = None
-    
+
+    # ---------------- db fetch ----------------
+
     def get_map_info(self, map_name):
-        """
-        获取地图基本信息
-        
-        Args:
-            map_name: 地图名称
-            
-        Returns:
-            地图信息字典或None
-        """
         result = self.db_manager.fetch_one(
             "SELECT name, width, height FROM map WHERE name = ?",
             (map_name,)
         )
-        
         if result:
-            return {
-                "name": result[0],
-                "width": result[1],
-                "height": result[2]
-            }
+            return {"name": result[0], "width": int(result[1]), "height": int(result[2])}
         return None
-    
-    def draw_map(self, map_name, layer_index=1, show_grid=True, show_building_areas=True, 
-                 show_area_names=True, show_rooms=True, fig_size=(10, 10)):
+
+    def _fetch_rooms(self, map_name, layer_index):
+        query = """
+        SELECT name, wall_grid_list, space_grid_list, inner_wall_grid_list, door_grid_list, vector_params
+        FROM room
+        WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?
         """
-        绘制地牢地图及其建筑区和房间
-        
-        Args:
-            map_name: 要绘制的地图名称
-            layer_index: 要显示的层级，默认为1
-            show_grid: 是否显示网格线
-            show_building_areas: 是否显示建筑区
-            show_area_names: 是否显示建筑区名称
-            show_rooms: 是否显示房间
-            fig_size: 图像尺寸，默认为(10, 10)英寸
-            
-        Returns:
-            matplotlib图表对象
+        rows = self.db_manager.fetch_all(query, (map_name, layer_index, layer_index))
+
+        rooms = []
+        for row in rows:
+            name, wall_s, space_s, inner_s, door_s, vec_s = row
+            try:
+                rooms.append({
+                    "name": name,
+                    "wall": json.loads(wall_s) if wall_s else [],
+                    "space": json.loads(space_s) if space_s else [],
+                    "inner_wall": json.loads(inner_s) if inner_s else [],
+                    "door": json.loads(door_s) if door_s else [],
+                    "vector": json.loads(vec_s) if vec_s else {},
+                })
+            except Exception as e:
+                print(f"解析房间 '{name}' JSON 出错: {e}")
+        return rooms
+
+    def _fetch_building_areas(self, map_name, layer_index):
+        return self.db_manager.fetch_all(
+            "SELECT name, position, type, corner, size FROM building_areas "
+            "WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?",
+            (map_name, layer_index, layer_index)
+        )
+
+    # ---------------- masks + imshow helpers ----------------
+
+    @staticmethod
+    def _stamp_mask(mask, pts, W, H):
         """
-        # 获取地图信息
+        mask: HxW uint8
+        pts: [[x,y], ...]
+        """
+        if not pts:
+            return
+        try:
+            import numpy as np
+        except Exception as e:
+            raise RuntimeError("需要 numpy 才能使用 imshow 掩码渲染。请先 pip install numpy") from e
+
+        arr = np.asarray(pts, dtype=np.int32)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            return
+
+        xs = arr[:, 0]
+        ys = arr[:, 1]
+        m = (xs >= 0) & (xs < W) & (ys >= 0) & (ys < H)
+        xs = xs[m]
+        ys = ys[m]
+        mask[ys, xs] = 1
+
+    @staticmethod
+    def _imshow_mask(ax, mask, rgba, W, H, zorder):
+        """
+        用两色 ListedColormap 显示 mask：
+        0 -> 透明
+        1 -> rgba
+        """
+        cmap = ListedColormap([(0, 0, 0, 0), rgba])
+        ax.imshow(
+            mask,
+            origin="lower",
+            interpolation="nearest",
+            cmap=cmap,
+            extent=(0, W, 0, H),
+            zorder=zorder
+        )
+
+    # ---------------- draw pieces ----------------
+
+    def _draw_building_areas(self, ax, building_areas, area_color, show_area_names, zorder):
+        for area in building_areas:
+            name, position_str, area_type, corner_str, size_str = area
+
+            try:
+                position = json.loads(position_str)
+            except Exception:
+                position = eval(position_str) if position_str else None
+
+            if area_type == "circle":
+                try:
+                    radius = float(corner_str)
+                    if position and radius > 0:
+                        circle = patches.Circle(
+                            position, radius,
+                            facecolor=area_color,
+                            edgecolor="red",
+                            linewidth=1,
+                            zorder=zorder
+                        )
+                        ax.add_patch(circle)
+                        if show_area_names:
+                            ax.text(
+                                position[0], position[1], name,
+                                ha="center", va="center",
+                                fontsize=8,
+                                zorder=zorder + 0.1,
+                                **({"fontproperties": self.chinese_font} if self.chinese_font else {})
+                            )
+                except Exception as e:
+                    print(f"绘制圆形建筑区 '{name}' 时出错: {e}")
+            else:
+                try:
+                    corners = json.loads(corner_str)
+                    if corners and isinstance(corners, list) and len(corners) >= 3:
+                        polygon = patches.Polygon(
+                            corners,
+                            facecolor=area_color,
+                            edgecolor="red",
+                            linewidth=1,
+                            zorder=zorder
+                        )
+                        ax.add_patch(polygon)
+
+                        if show_area_names:
+                            cx = sum(p[0] for p in corners) / len(corners)
+                            cy = sum(p[1] for p in corners) / len(corners)
+                            ax.text(
+                                cx, cy, name,
+                                ha="center", va="center",
+                                fontsize=8,
+                                zorder=zorder + 0.1,
+                                **({"fontproperties": self.chinese_font} if self.chinese_font else {})
+                            )
+                except Exception as e:
+                    print(f"绘制建筑区 '{name}' 时出错: {e}")
+
+    def _draw_room_vectors(self, ax, rooms, room_vector_color, show_room_names, zorder):
+        for r in rooms:
+            name = r["name"]
+            vec = r["vector"] or {}
+            room_type = vec.get("type", "unknown")
+            center = vec.get("center", [0, 0])
+
+            try:
+                if room_type == "circle":
+                    radius = vec.get("radius", 0)
+                    if radius > 0:
+                        circle = patches.Circle(
+                            center,
+                            radius=radius,
+                            facecolor=room_vector_color,
+                            edgecolor="blue",
+                            linewidth=1.0,
+                            zorder=zorder
+                        )
+                        ax.add_patch(circle)
+
+                elif "corners" in vec and isinstance(vec["corners"], list) and len(vec["corners"]) >= 3:
+                    corners = vec["corners"]
+                    poly = patches.Polygon(
+                        corners,
+                        closed=True,
+                        facecolor=room_vector_color,
+                        edgecolor="blue",
+                        linewidth=1.0,
+                        zorder=zorder
+                    )
+                    ax.add_patch(poly)
+
+                    if "center" not in vec:
+                        center = [
+                            sum(p[0] for p in corners) / len(corners),
+                            sum(p[1] for p in corners) / len(corners),
+                        ]
+                else:
+                    # 兜底：如果没有矢量 corners，就不画
+                    pass
+
+                if show_room_names:
+                    ax.text(
+                        center[0], center[1], name,
+                        ha="center", va="center",
+                        color="blue",
+                        fontsize=8,
+                        zorder=zorder + 0.2,
+                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.7),
+                        **({"fontproperties": self.chinese_font} if self.chinese_font else {})
+                    )
+            except Exception as e:
+                print(f"绘制房间矢量 '{name}' 出错: {e}")
+
+    def _draw_item_vectors_from_doors(self, ax, door_mask, W, H, zorder):
+        """
+        物品矢量层（当前用 door_mask 做示例）：
+        - 用 scatter 标出门格子中心点（比画一堆 Rectangle 轻得多）
+        """
+        try:
+            import numpy as np
+        except Exception as e:
+            raise RuntimeError("需要 numpy 才能使用 item_vector 渲染。请先 pip install numpy") from e
+
+        ys, xs = (door_mask > 0).nonzero()
+        if xs.size == 0:
+            return
+
+        # 点太多时可采样，避免 PDF 体积爆炸
+        max_points = 20000
+        if xs.size > max_points:
+            idx = np.random.choice(xs.size, max_points, replace=False)
+            xs = xs[idx]
+            ys = ys[idx]
+
+        ax.scatter(
+            xs + 0.5, ys + 0.5,
+            s=6,
+            marker="x",
+            linewidths=0.6,
+            zorder=zorder
+        )
+
+    # ---------------- public draw API ----------------
+
+    def draw_map(
+        self,
+        map_name,
+        layer_index=1,
+        fig_size=(10, 10),
+        show_grid=True,
+        show_area_names=True,
+        show_room_names=True,
+        # 五层可控开关
+        show_building_areas=True,
+        show_room_grid=True,
+        show_room_vector=True,
+        show_item_grid=True,
+        show_item_vector=False,
+        # 叠放顺序（从底到顶）
+        layer_order=None,
+        # 网格细分控制（避免 1000x1000 时 minor tick 太重）
+        grid_major_step=10,
+        grid_minor_step=None,
+    ):
+        """
+        绘制单张地图（单层级）
+        - layer_order: e.g. ["building_areas","room_grid","room_vector","item_grid","item_vector"]
+        """
+
         map_info = self.get_map_info(map_name)
         if not map_info:
             print(f"错误: 找不到名为 '{map_name}' 的地图")
             return None
-        
-        map_width = map_info["width"]
-        map_height = map_info["height"]
-        
-        # 设置颜色常量
-        area_color = (1.0, 0.4, 0.4, 0.5)  # 半透明红色
-        room_vector_color = (0.4, 0.4, 1.0, 0.3)  # 半透明蓝色
-        room_outer_wall_color = (0.3, 0.3, 0.3, 1.0)  # 不透明深灰色
-        room_inner_color = (0.8, 0.8, 0.8, 1.0)  # 不透明浅灰色
-        room_inner_wall_color = (0.7, 0.2, 0.2, 0.8)  # 不透明红棕色
-        
-        # 创建图表
+
+        W = map_info["width"]
+        H = map_info["height"]
+
+        # 默认叠放顺序：建筑区 -> 房间格子 -> 房间矢量 -> 物品格子 -> 物品矢量
+        if layer_order is None:
+            layer_order = [self.L_BUILDING, self.L_ROOM_GRID, self.L_ROOM_VECTOR, self.L_ITEM_GRID, self.L_ITEM_VECTOR]
+
+        # 清洗 order：只保留合法层，并确保五层都可被放进去（你想要缺省也行）
+        cleaned = []
+        for k in layer_order:
+            if k in self.ALL_LAYERS and k not in cleaned:
+                cleaned.append(k)
+        layer_order = cleaned
+
+        enabled = {
+            self.L_BUILDING: bool(show_building_areas),
+            self.L_ROOM_GRID: bool(show_room_grid),
+            self.L_ROOM_VECTOR: bool(show_room_vector),
+            self.L_ITEM_GRID: bool(show_item_grid),
+            self.L_ITEM_VECTOR: bool(show_item_vector),
+        }
+
+        # 颜色（保持你原来的风格）
+        area_color = (1.0, 0.4, 0.4, 0.5)          # 建筑区 半透明红
+        room_vector_color = (0.4, 0.4, 1.0, 0.3)   # 房间矢量 半透明蓝
+        room_outer_wall_color = (0.3, 0.3, 0.3, 1.0)
+        room_inner_color = (0.8, 0.8, 0.8, 1.0)
+        room_inner_wall_color = (0.7, 0.2, 0.2, 0.8)
+        door_color = (1.0, 1.0, 0.0, 1.0)          # 门/物品格子 黄
+
+        # 图
         fig, ax = plt.subplots(figsize=fig_size)
-        ax.set_xlim(0, map_width)
-        ax.set_ylim(0, map_height)
-        ax.set_aspect('equal')  # 确保X和Y轴比例相同
-        
-        # 设置标题
+        ax.set_xlim(0, W)
+        ax.set_ylim(0, H)
+        ax.set_aspect("equal")
+
         if self.chinese_font:
             ax.set_title(f"{map_name} - 层级 {layer_index}", fontproperties=self.chinese_font)
         else:
             ax.set_title(f"{map_name} - 层级 {layer_index}")
-        
-        # 显示网格
+
+        # 网格
         if show_grid:
-            # 主网格线（每10个单位）
-            ax.grid(True, which='major', linestyle='-', linewidth=0.5, color='#cccccc')
-            # 设置主网格线间隔
-            ax.set_xticks(range(0, map_width + 1, 10))
-            ax.set_yticks(range(0, map_height + 1, 10))
-            
-            # 次网格线（每个单位）
-            ax.grid(True, which='minor', linestyle=':', linewidth=0.2, color='#f0f0f0')
-            ax.set_xticks(range(0, map_width + 1), minor=True)
-            ax.set_yticks(range(0, map_height + 1), minor=True)
-        
-        # 显示建筑区
-        if show_building_areas:
-            self._draw_building_areas(ax, map_name, layer_index, area_color, show_area_names)
-        
-        # 显示房间（预留）
-        if show_rooms:
-            self._draw_rooms(ax, map_name, layer_index, room_vector_color, 
-                           room_outer_wall_color, room_inner_color, room_inner_wall_color)
-        
-        return fig
-    
-    def _draw_building_areas(self, ax, map_name, layer_index, area_color, show_area_names):
-        """
-        绘制建筑区
-        
-        Args:
-            ax: matplotlib轴对象
-            map_name: 地图名称
-            layer_index: 层级索引
-            area_color: 建筑区颜色
-            show_area_names: 是否显示建筑区名称
-        """
-        # 获取建筑区数据，查找与指定层有交集的建筑区
-        building_areas = self.db_manager.fetch_all(
-            "SELECT name, position, type, corner, size FROM building_areas WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?",
-            (map_name, layer_index, layer_index)
-        )
-        
-        import json
-        
-        for area in building_areas:
-            name, position_str, area_type, corner_str, size_str = area
-            
-            # 解析位置、角点和大小
+            ax.grid(True, which="major", linestyle="-", linewidth=0.5, color="#cccccc")
+            ax.set_xticks(range(0, W + 1, max(1, int(grid_major_step))))
+            ax.set_yticks(range(0, H + 1, max(1, int(grid_major_step))))
+
+            if grid_minor_step is None:
+                # 默认：大图不画 minor，避免 tick 数量爆炸
+                grid_minor_step = 1 if max(W, H) <= 300 else 0
+
+            if grid_minor_step and grid_minor_step > 0:
+                ax.grid(True, which="minor", linestyle=":", linewidth=0.2, color="#f0f0f0")
+                ax.set_xticks(range(0, W + 1, int(grid_minor_step)), minor=True)
+                ax.set_yticks(range(0, H + 1, int(grid_minor_step)), minor=True)
+
+        # 预取数据（按需）
+        rooms = None
+        building_areas = None
+
+        needs_rooms = enabled[self.L_ROOM_GRID] or enabled[self.L_ROOM_VECTOR] or enabled[self.L_ITEM_GRID] or enabled[self.L_ITEM_VECTOR]
+        if needs_rooms:
+            rooms = self._fetch_rooms(map_name, layer_index)
+
+        if enabled[self.L_BUILDING]:
+            building_areas = self._fetch_building_areas(map_name, layer_index)
+
+        # 掩码（按需）
+        floor_mask = wall_mask = inner_wall_mask = door_mask = None
+        if enabled[self.L_ROOM_GRID] or enabled[self.L_ITEM_GRID] or enabled[self.L_ITEM_VECTOR]:
             try:
-                position = json.loads(position_str)
-            except:
-                position = eval(position_str) if position_str else None
-            
-            if area_type == "circle":
-                # 绘制圆形建筑区
-                try:
-                    radius = float(corner_str)
-                    if position and radius > 0:
-                        circle = patches.Circle(position, radius, facecolor=area_color, 
-                                              edgecolor='red', linewidth=1)
-                        ax.add_patch(circle)
-                        
-                        # 显示建筑区名称
-                        if show_area_names:
-                            ax.text(position[0], position[1], name, ha='center', va='center',
-                                   fontsize=8, **{"fontproperties": self.chinese_font} if self.chinese_font else {})
-                except Exception as e:
-                    print(f"绘制圆形建筑区 '{name}' 时出错: {e}")
-            else:
-                # 绘制多边形建筑区
-                try:
-                    corners = json.loads(corner_str)
-                    if corners and isinstance(corners, list) and len(corners) >= 3:
-                        polygon = patches.Polygon(corners, facecolor=area_color, 
-                                                edgecolor='red', linewidth=1)
-                        ax.add_patch(polygon)
-                        
-                        # 计算中心点用于显示名称
-                        if show_area_names:
-                            # 计算多边形中心点
-                            x_coords = [p[0] for p in corners]
-                            y_coords = [p[1] for p in corners]
-                            center_x = sum(x_coords) / len(x_coords)
-                            center_y = sum(y_coords) / len(y_coords)
-                            
-                            ax.text(center_x, center_y, name, ha='center', va='center',
-                                   fontsize=8, **{"fontproperties": self.chinese_font} if self.chinese_font else {})
-                except Exception as e:
-                    print(f"绘制建筑区 '{name}' 时出错: {e}")
-    
-    def _draw_rooms(self, ax, map_name, layer_index, room_vector_color, 
-                   room_outer_wall_color, room_inner_color, room_inner_wall_color):
-        """
-        绘制房间和墙壁，使用与重构前相同的格子系统
-        
-        Args:
-            ax: matplotlib轴对象
-            map_name: 地图名称
-            layer_index: 层级索引
-            room_vector_color: 房间矢量颜色
-            room_outer_wall_color: 房间外墙颜色
-            room_inner_color: 房间内部颜色
-            room_inner_wall_color: 房间内墙颜色
-        """
-        # 更新查询语句，使用min_layer和max_layer字段
-        query = '''
-        SELECT name, wall_grid_list, space_grid_list, inner_wall_grid_list, door_grid_list, vector_params 
-        FROM room 
-        WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?
-        '''
-        params = (map_name, layer_index, layer_index)
-        
-        rooms = self.db_manager.fetch_all(query, params)
-        
-        import json
-        
-        # 定义绘制房间内部格子的辅助函数，确保与地图格子对齐
-        def draw_room_space_grids(ax, space_grid_list, color):
-            for x, y in space_grid_list:
-                rect = patches.Rectangle(
-                    (x, y), 1, 1,  # 直接使用(x, y)作为左下角坐标，确保与地图格子对齐
-                    facecolor=color,
-                    edgecolor='none',
-                    zorder=2
-                )
-                ax.add_patch(rect)
-        
-        # 定义绘制房间外墙格子的辅助函数，确保与地图格子对齐
-        def draw_room_wall_grids(ax, wall_grid_list, color):
-            for x, y in wall_grid_list:
-                rect = patches.Rectangle(
-                    (x, y), 1, 1,  # 直接使用(x, y)作为左下角坐标，确保与地图格子对齐
-                    facecolor=color,
-                    edgecolor='black',
-                    linewidth=0.5,
-                    zorder=3
-                )
-                ax.add_patch(rect)
-        
-        # 定义绘制房间内墙格子的辅助函数，确保与地图格子对齐
-        def draw_room_inner_wall_grids(ax, inner_wall_grid_list, color):
-            for x, y in inner_wall_grid_list:
-                rect = patches.Rectangle(
-                    (x, y), 1, 1,  # 直接使用(x, y)作为左下角坐标，确保与地图格子对齐
-                    facecolor=color,
-                    edgecolor='black',
-                    linewidth=0.5,
-                    zorder=4
-                )
-                ax.add_patch(rect)
-        
-        # 定义绘制房间门格子的辅助函数，确保与地图格子对齐
-        def draw_room_door_grids(ax, door_grid_list, color):
-            for x, y in door_grid_list:
-                rect = patches.Rectangle(
-                    (x, y), 1, 1,  # 直接使用(x, y)作为左下角坐标，确保与地图格子对齐
-                    facecolor=color,
-                    edgecolor='black',
-                    linewidth=0.5,
-                    zorder=5.5  # 门应该显示在矢量图之上
-                )
-                ax.add_patch(rect)
-        
-        # 定义绘制房间矢量轮廓的辅助函数
-        def draw_room_vector_outline(ax, vector_params, color):
-            import math
-            room_type = vector_params.get("type", "unknown")
-            center = vector_params.get("center", [0, 0])
-            
-            # 对于圆形
-            if room_type == "circle":
-                radius = vector_params.get("radius", 0)
-                if radius > 0:
-                    circle = patches.Circle(
-                        center, radius=radius,
-                        facecolor=color,
-                        edgecolor='blue',
-                        linewidth=1.5,
-                        zorder=4.5  # 矢量图显示在房间方块上层，门的下层
-                    )
-                    ax.add_patch(circle)
-                    return center
-            
-            # 对于多边形，使用corners参数
-            if "corners" in vector_params and len(vector_params["corners"]) >= 3:
-                corners = vector_params["corners"]
-                # 如果没有center，计算中心点
-                if "center" not in vector_params:
-                    center = [
-                        sum(p[0] for p in corners) / len(corners),
-                        sum(p[1] for p in corners) / len(corners)
-                    ]
-                
-                poly = patches.Polygon(
-                    corners,
-                    closed=True,
-                    facecolor=color,
-                    edgecolor='blue',
-                    linewidth=1.5,
-                    zorder=4.5  # 矢量图显示在房间方块上层，门的下层
-                )
-                ax.add_patch(poly)
-                return center
-            
-            # 对于矩形
-            if room_type in ["rectangle", "rotated_rectangle"]:
-                width = vector_params.get("width", 0)
-                height = vector_params.get("height", 0)
-                angle = vector_params.get("angle", 0)
-                
-                # 计算矩形的四个角点
-                half_w = width / 2
-                half_h = height / 2
-                corners = [
-                    [center[0] - half_w, center[1] - half_h],
-                    [center[0] + half_w, center[1] - half_h],
-                    [center[0] + half_w, center[1] + half_h],
-                    [center[0] - half_w, center[1] + half_h]
-                ]
-                
-                # 如果有旋转角度，旋转角点
-                if angle != 0:
-                    cos_a = math.cos(angle)
-                    sin_a = math.sin(angle)
-                    
-                    for i, point in enumerate(corners):
-                        x = point[0] - center[0]
-                        y = point[1] - center[1]
-                        rotated_x = x * cos_a - y * sin_a
-                        rotated_y = x * sin_a + y * cos_a
-                        corners[i] = [center[0] + rotated_x, center[1] + rotated_y]
-                
-                poly = patches.Polygon(
-                    corners,
-                    closed=True,
-                    facecolor=color,
-                    edgecolor='blue',
-                    linewidth=1.5,
-                    zorder=4.5  # 矢量图显示在房间方块上层，门的下层
-                )
-                ax.add_patch(poly)
-                return center
-            
-            return center
-        
-        # 定义添加房间名称的辅助函数
-        def add_room_name(ax, center, name):
-            ax.text(center[0], center[1], name,
-                   ha='center', va='center',
-                   color='blue', fontsize=8,
-                   zorder=5,
-                   bbox=dict(facecolor='white', edgecolor='none', alpha=0.7),
-                   **{"fontproperties": self.chinese_font} if self.chinese_font else {})
-        
-        # 处理每个房间
-        for room in rooms:
-            name, wall_grid_str, space_grid_str, inner_wall_grid_str, door_grid_str, vector_params_str = room
-            
-            try:
-                # 解析JSON数据
-                wall_grid_list = json.loads(wall_grid_str)
-                space_grid_list = json.loads(space_grid_str)
-                inner_wall_grid_list = json.loads(inner_wall_grid_str) if inner_wall_grid_str else []
-                door_grid_list = json.loads(door_grid_str) if door_grid_str else []
-                vector_params = json.loads(vector_params_str)
-                
-                # 使用与重构前相同的颜色配置
-                color_config = {
-                    '内部颜色': (0.8, 0.8, 0.8, 1.0),  # 不透明浅灰色
-                    '外墙颜色': (0.3, 0.3, 0.3, 1.0),  # 不透明深灰色
-                    '内墙颜色': (0.7, 0.2, 0.2, 0.8),  # 不透明红棕色
-                    '门颜色': (1.0, 1.0, 0.0, 1.0),    # 不透明黄色，用于门的渲染
-                    '矢量颜色': (0.4, 0.4, 1.0, 0.3)   # 半透明蓝色
-                }
-                
-                # 1. 绘制房间内部格子
-                draw_room_space_grids(ax, space_grid_list, color_config['内部颜色'])
-                
-                # 2. 绘制房间外墙格子
-                draw_room_wall_grids(ax, wall_grid_list, color_config['外墙颜色'])
-                
-                # 3. 绘制房间内墙格子
-                draw_room_inner_wall_grids(ax, inner_wall_grid_list, color_config['内墙颜色'])
-                
-                # 4. 绘制房间矢量轮廓，提高zorder使其显示在房间方块上层
-                center = draw_room_vector_outline(ax, vector_params, color_config['矢量颜色'])
-                
-                # 5. 绘制房间门格子，提高zorder使其显示在矢量图上层
-                draw_room_door_grids(ax, door_grid_list, color_config['门颜色'])
-                
-                # 6. 添加房间名称
-                add_room_name(ax, center, name)
-                
+                import numpy as np
             except Exception as e:
-                print(f"处理房间 '{name}' 时出错: {e}")
+                raise RuntimeError("需要 numpy 才能使用 imshow 掩码渲染。请先 pip install numpy") from e
+
+            floor_mask = np.zeros((H, W), dtype=np.uint8)
+            wall_mask = np.zeros((H, W), dtype=np.uint8)
+            inner_wall_mask = np.zeros((H, W), dtype=np.uint8)
+            door_mask = np.zeros((H, W), dtype=np.uint8)
+
+            for r in rooms or []:
+                # 房间格子层需要：space/wall/inner_wall
+                if enabled[self.L_ROOM_GRID]:
+                    self._stamp_mask(floor_mask, r["space"], W, H)
+                    self._stamp_mask(wall_mask, r["wall"], W, H)
+                    self._stamp_mask(inner_wall_mask, r["inner_wall"], W, H)
+
+                # 物品格子层需要：door
+                if enabled[self.L_ITEM_GRID] or enabled[self.L_ITEM_VECTOR]:
+                    self._stamp_mask(door_mask, r["door"], W, H)
+
+        # 逐层渲染（按 layer_order 决定叠放）
+        base_z = 10
+        for i, layer_key in enumerate(layer_order):
+            if not enabled.get(layer_key, False):
                 continue
-    
-    def save_map(self, fig, filename, formats=None, output_dir="地图输出"):
+            z = base_z + i
+
+            if layer_key == self.L_BUILDING:
+                self._draw_building_areas(ax, building_areas or [], area_color, show_area_names, zorder=z)
+
+            elif layer_key == self.L_ROOM_GRID:
+                # 地板 -> 外墙 -> 内墙（同一层内固定顺序）
+                self._imshow_mask(ax, floor_mask, room_inner_color, W, H, zorder=z + 0.0)
+                self._imshow_mask(ax, wall_mask, room_outer_wall_color, W, H, zorder=z + 0.1)
+                self._imshow_mask(ax, inner_wall_mask, room_inner_wall_color, W, H, zorder=z + 0.2)
+
+            elif layer_key == self.L_ROOM_VECTOR:
+                self._draw_room_vectors(ax, rooms or [], room_vector_color, show_room_names, zorder=z)
+
+            elif layer_key == self.L_ITEM_GRID:
+                # 门格子（物品格子层）
+                self._imshow_mask(ax, door_mask, door_color, W, H, zorder=z)
+
+            elif layer_key == self.L_ITEM_VECTOR:
+                # 门矢量（物品矢量层）：用 scatter 标点
+                self._draw_item_vectors_from_doors(ax, door_mask, W, H, zorder=z)
+
+        return fig
+
+    # ---------------- save helpers ----------------
+
+    def save_map(self, fig, filename, formats=None, output_dir="地图输出", dpi=150, tight_bbox=False):
         """
         保存地图图像到文件
-        
-        Args:
-            fig: matplotlib图表对象
-            filename: 文件名（不含扩展名）
-            formats: 要保存的格式列表，如['png', 'pdf']，默认为['png']
-            output_dir: 输出目录，默认为"地图输出"
+        - 默认 tight_bbox=False：避免 bbox_inches='tight' 在大量元素时巨慢
         """
         if formats is None:
-            formats = ['png']
-        
-        # 确保输出目录存在
+            formats = ["png"]
+
         os.makedirs(output_dir, exist_ok=True)
-        
-        # 保存到不同格式
+
         for fmt in formats:
             save_path = os.path.join(output_dir, f"{filename}.{fmt}")
             try:
-                fig.savefig(save_path, dpi=300, bbox_inches='tight', format=fmt)
+                if tight_bbox:
+                    fig.savefig(save_path, dpi=dpi, bbox_inches="tight", format=fmt)
+                else:
+                    fig.savefig(save_path, dpi=dpi, format=fmt)
                 print(f"✅ 成功保存地图到: {save_path}")
             except Exception as e:
                 print(f"❌ 保存地图到 {save_path} 时出错: {e}")
-        
-        # 关闭图表，释放资源
+
         plt.close(fig)
-    
-    def save_map_by_layer(self, map_name, layers=None, output_dir="地图输出", 
-                         formats=['png', 'pdf'], fig_size=(10, 10)):
-        """
-        保存指定地图和层级的图像
-        
-        Args:
-            map_name: 地图名称
-            layers: 层级列表，默认为所有层级
-            output_dir: 输出目录
-            formats: 保存格式列表
-            fig_size: 图像尺寸
-        """
-        # 获取地图的所有层级
+
+    def save_map_by_layer(
+        self,
+        map_name,
+        layers=None,
+        output_dir="地图输出",
+        formats=("png", "pdf"),
+        fig_size=(10, 10),
+        dpi=150,
+        tight_bbox=False,
+        # draw_map 参数透传
+        **draw_kwargs
+    ):
         if layers is None:
-            # 使用max_layer字段获取最大层级
             max_layer = self.db_manager.fetch_one(
                 "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
                 (map_name,)
             )
-            max_layer = max_layer[0] if max_layer and max_layer[0] else 3  # 默认3层
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3
             layers = range(1, max_layer + 1)
-        
+
         for layer in layers:
-            # 绘制地图
-            fig = self.draw_map(map_name, layer, fig_size=fig_size)
+            fig = self.draw_map(map_name, layer_index=layer, fig_size=fig_size, **draw_kwargs)
             if fig:
-                # 保存地图
                 self.save_map(
-                    fig, 
-                    f"{map_name}_层{layer}", 
-                    formats=formats, 
-                    output_dir=output_dir
+                    fig,
+                    f"{map_name}_层{layer}",
+                    formats=list(formats),
+                    output_dir=output_dir,
+                    dpi=dpi,
+                    tight_bbox=tight_bbox
                 )
-    
-    def save_multi_layer_pdf(self, map_name, layers=None, output_dir="地图输出", 
-                           fig_size=(10, 10), show_building_areas=True, 
-                           show_rooms=True, show_grid=True, show_area_names=True):
+
+    def save_multi_layer_pdf(
+        self,
+        map_name,
+        layers=None,
+        output_dir="地图输出",
+        fig_size=(10, 10),
+        filename=None,
+        dpi=150,
+        tight_bbox=False,
+        # draw_map 参数透传
+        **draw_kwargs
+    ):
         """
-        将多个层级的地图保存到一个PDF文件中，每页一层
-        
-        Args:
-            map_name: 地图名称
-            layers: 层级列表，默认为所有层级
-            output_dir: 输出目录
-            fig_size: 图像尺寸
-            show_building_areas: 是否显示建筑区
-            show_rooms: 是否显示房间
-            show_grid: 是否显示网格
-            show_area_names: 是否显示建筑区名称
+        多层级合并 PDF：每页一个 layer_index
+        - 注意：tight_bbox=True 会更慢，默认关
         """
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-        
-        # 获取地图的所有层级
         if layers is None:
-            # 使用max_layer字段获取最大层级
             max_layer = self.db_manager.fetch_one(
                 "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
                 (map_name,)
             )
-            max_layer = max_layer[0] if max_layer and max_layer[0] else 3  # 默认3层
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3
             layers = range(1, max_layer + 1)
-        
-        # 创建输出目录
+
         os.makedirs(output_dir, exist_ok=True)
-        
-        # 创建PDF文件，确保文件名没有空格
-        safe_map_name = map_name.replace(" ", "_")
-        pdf_path = os.path.join(output_dir, f"{safe_map_name}_多层.pdf")
+
+        safe_name = (filename or map_name).replace(" ", "_")
+        pdf_path = os.path.join(output_dir, f"{safe_name}_多层.pdf")
+
         with PdfPages(pdf_path) as pdf:
             for layer in layers:
-                # 绘制地图
-                fig = self.draw_map(
-                    map_name, 
-                    layer, 
-                    show_grid=show_grid, 
-                    show_building_areas=show_building_areas, 
-                    show_area_names=show_area_names, 
-                    show_rooms=show_rooms, 
-                    fig_size=fig_size
-                )
+                fig = self.draw_map(map_name, layer_index=layer, fig_size=fig_size, **draw_kwargs)
                 if fig:
-                    # 添加到PDF
-                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
-                    # 关闭图表，释放资源
+                    if tight_bbox:
+                        pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
+                    else:
+                        pdf.savefig(fig, dpi=dpi)
                     plt.close(fig)
-        
+
         print(f"✅ 成功保存多层PDF到: {pdf_path}")
         return pdf_path
-    
-    def save_combined_pdf(self, map_name, layers=None, output_dir="地图输出", 
-                           fig_size=(10, 10), show_building_areas=True, 
-                           show_rooms=True, show_grid=True, show_area_names=True, filename=None):
+
+    def save_combined_pdf(
+        self,
+        map_name,
+        layers=None,
+        output_dir="地图输出",
+        fig_size=(10, 10),
+        filename=None,
+        dpi=150,
+        tight_bbox=False,
+        page_specs=None,
+        # draw_map 参数透传（作为每个 page_spec 的默认值）
+        **default_draw_kwargs
+    ):
         """
-        将多个层级的地图保存到一个PDF文件中，按照物品层 -> 房间层 -> 建筑区层的顺序，每页一层
-        
-        Args:
-            map_name: 地图名称
-            layers: 层级列表，默认为所有层级
-            output_dir: 输出目录
-            fig_size: 图像尺寸
-            show_building_areas: 是否显示建筑区
-            show_rooms: 是否显示房间
-            show_grid: 是否显示网格
-            show_area_names: 是否显示建筑区名称
-            filename: 自定义文件名，默认使用map_name
+        组合 PDF（强力版）：
+        - 你可以用 page_specs 定义“页的顺序”和“每页用哪些层、层的叠放顺序”。
+
+        page_specs 示例（顺序就是页顺序）：
+        [
+          {
+            "title": "物品+房间+建筑区（全）",
+            "draw_kwargs": {
+                "layer_order": [...],
+                "show_item_grid": True,
+                "show_item_vector": True,
+                "show_room_grid": True,
+                "show_room_vector": True,
+                "show_building_areas": True,
+            }
+          },
+          {
+            "title": "仅房间（不画门）",
+            "draw_kwargs": {
+                "show_item_grid": False,
+                "show_item_vector": False,
+                "show_room_grid": True,
+                "show_room_vector": True,
+                "show_building_areas": True,
+            }
+          },
+          {
+            "title": "仅建筑区",
+            "draw_kwargs": {
+                "show_room_grid": False,
+                "show_room_vector": False,
+                "show_item_grid": False,
+                "show_item_vector": False,
+                "show_building_areas": True,
+            }
+          },
+        ]
         """
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-        
-        # 获取地图的所有层级
         if layers is None:
-            # 使用max_layer字段获取最大层级
             max_layer = self.db_manager.fetch_one(
                 "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
                 (map_name,)
             )
-            max_layer = max_layer[0] if max_layer and max_layer[0] else 3  # 默认3层
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3
             layers = range(1, max_layer + 1)
-        
-        # 创建输出目录
+
         os.makedirs(output_dir, exist_ok=True)
-        
-        # 创建PDF文件，确保文件名没有空格
-        if filename:
-            # 使用自定义文件名
-            safe_filename = filename.replace(" ", "_")
-        else:
-            # 使用map_name作为文件名
-            safe_filename = map_name.replace(" ", "_")
-        
+        safe_filename = (filename or map_name).replace(" ", "_")
         pdf_path = os.path.join(output_dir, f"{safe_filename}.pdf")
-        
+
+        # 默认：只输出一组“当前 draw_kwargs”的页面（每层级一页）
+        if page_specs is None:
+            page_specs = [
+                {"title": "地图", "draw_kwargs": dict(default_draw_kwargs)}
+            ]
+
         with PdfPages(pdf_path) as pdf:
-            # 1. 物品层：显示建筑区 + 房间 + 物品（门）
-            print(f"\n生成物品层（带门）...")
-            for layer in layers:
-                # 绘制地图，显示所有元素（建筑区、房间、物品）
-                fig = self.draw_map(
-                    map_name, 
-                    layer, 
-                    show_grid=show_grid, 
-                    show_building_areas=show_building_areas, 
-                    show_area_names=show_area_names, 
-                    show_rooms=show_rooms,  # 显示房间，包含门
-                    fig_size=fig_size
-                )
-                if fig:
-                    # 修改标题，明确显示这是物品层
-                    if self.chinese_font:
-                        plt.title(f"{map_name} - 层级 {layer}（物品层）", fontproperties=self.chinese_font)
-                    else:
-                        plt.title(f"{map_name} - 层级 {layer}（物品层）")
-                    # 添加到PDF
-                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
-                    # 关闭图表，释放资源
-                    plt.close(fig)
-            
-            # 2. 房间层：显示建筑区 + 房间（不带物品）
-            print(f"\n生成房间层（带房间区）...")
-            for layer in layers:
-                # 绘制地图，显示建筑区和房间，但隐藏物品（门）
-                fig = self.draw_map(
-                    map_name, 
-                    layer, 
-                    show_grid=show_grid, 
-                    show_building_areas=show_building_areas, 
-                    show_area_names=show_area_names, 
-                    show_rooms=show_rooms,  # 显示房间，但不单独突出物品
-                    fig_size=fig_size
-                )
-                if fig:
-                    # 修改标题，明确显示这是房间层
-                    if self.chinese_font:
-                        plt.title(f"{map_name} - 层级 {layer}（房间层）", fontproperties=self.chinese_font)
-                    else:
-                        plt.title(f"{map_name} - 层级 {layer}（房间层）")
-                    # 添加到PDF
-                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
-                    # 关闭图表，释放资源
-                    plt.close(fig)
-            
-            # 3. 建筑区层：只显示建筑区
-            print(f"\n生成建筑区层（仅建筑区）...")
-            for layer in layers:
-                # 绘制地图，只显示建筑区
-                fig = self.draw_map(
-                    map_name, 
-                    layer, 
-                    show_grid=show_grid, 
-                    show_building_areas=show_building_areas, 
-                    show_area_names=show_area_names, 
-                    show_rooms=False,  # 不显示房间和物品
-                    fig_size=fig_size
-                )
-                if fig:
-                    # 修改标题，明确显示这是建筑区层
-                    if self.chinese_font:
-                        plt.title(f"{map_name} - 层级 {layer}（建筑区层）", fontproperties=self.chinese_font)
-                    else:
-                        plt.title(f"{map_name} - 层级 {layer}（建筑区层）")
-                    # 添加到PDF
-                    pdf.savefig(fig, dpi=300, bbox_inches='tight')
-                    # 关闭图表，释放资源
-                    plt.close(fig)
-        
+            for spec in page_specs:
+                title = spec.get("title", "地图")
+                draw_kwargs = dict(default_draw_kwargs)
+                draw_kwargs.update(spec.get("draw_kwargs", {}))
+
+                for layer in layers:
+                    fig = self.draw_map(map_name, layer_index=layer, fig_size=fig_size, **draw_kwargs)
+                    if fig:
+                        if self.chinese_font:
+                            plt.title(f"{map_name} - 层级 {layer}（{title}）", fontproperties=self.chinese_font)
+                        else:
+                            plt.title(f"{map_name} - 层级 {layer}（{title}）")
+
+                        if tight_bbox:
+                            pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
+                        else:
+                            pdf.savefig(fig, dpi=dpi)
+
+                        plt.close(fig)
+
         print(f"✅ 成功保存组合PDF到: {pdf_path}")
         return pdf_path
 
     def close(self):
-        """
-        关闭数据库连接
-        """
         self.db_manager.close()
