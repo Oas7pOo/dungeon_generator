@@ -15,6 +15,14 @@ _ALIAS = {
     "透明": "transparent",
     "空白": "blank",
     "无": "blank",
+
+    "露台": "terrace",
+    "阳台": "terrace",
+
+    "无露台": "no_terrace",
+    "不生成露台": "no_terrace",
+    "no_terrace": "no_terrace",
+    "no-terrace": "no_terrace",
 }
 
 def parse_tags(tags_raw: List[str]) -> List[str]:
@@ -26,14 +34,17 @@ def parse_tags(tags_raw: List[str]) -> List[str]:
         if not s:
             continue
         s = _ALIAS.get(s, s)
-        # 归一化一些写法
+
         if s in ("hallway", "corridor"):
             s = "hallways"
         if s == "no_hallways":
-            # 简化：不加 hallways 即等价于 JS 的 noNooks=true
-            continue
+            continue  # 这个你原本就当“不传 hallways”处理
+
+        # ✅ no_terrace 必须保留
         if s not in out:
             out.append(s)
+
     if not out:
         out = ["default"]
     return out
+

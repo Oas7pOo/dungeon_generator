@@ -65,13 +65,13 @@ def test_dwellings_house_writer():
     ).lastrowid
     print(f"✅ 创建测试地图，map_id={map_id}")
     
-    # 创建测试建筑区（更大尺寸，200×200细网格，对应20×20粗网格）
-    corners = [[50, 50], [250, 50], [250, 250], [50, 250]]
+    # 创建测试建筑区（150×150细网格，对应15×15粗网格）
+    corners = [[75, 75], [225, 75], [225, 225], [75, 225]]
     building_area_id = db_manager.execute(
         "INSERT INTO building_area (map_id, name, layer_start, layer_end, geom_type, center_x, center_y, radius, geom_json, size_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (map_id, "测试建筑区", 1, 3, "rectangle", 150.0, 150.0, None, 
          json.dumps(corners), 
-         json.dumps({"width": 200, "height": 200}))
+         json.dumps({"width": 150, "height": 150}))
     ).lastrowid
     print(f"✅ 创建测试建筑区，building_area_id={building_area_id}")
     
@@ -80,8 +80,8 @@ def test_dwellings_house_writer():
     result = writer.generate_and_save_dwelling(
         building_area_id=building_area_id,
         seed=42,
-        tags_raw=["默认", "机械", "走廊", "no_terrace"],
-        n_floors=3,  # 3层建筑，测试退台但不生成露台
+        tags_raw=["默认", "有机", "走廊", "露台"],
+        n_floors=3,  # 3层建筑，测试退台和露台生成
     )
     
     print(f"\n📊 生成结果：")

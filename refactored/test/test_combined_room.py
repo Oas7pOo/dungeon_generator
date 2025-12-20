@@ -83,21 +83,22 @@ def test_building_area_stress():
     print("正在清理旧数据...")
     db_manager.execute("DELETE FROM item")
     db_manager.execute("DELETE FROM room")
-    db_manager.execute("DELETE FROM building_areas")
+    db_manager.execute("DELETE FROM building_area")
     db_manager.execute("DELETE FROM map")
     print("旧数据清理完成，开始生成新的地图和建筑区...")
     
     # 插入新的地图数据
-    db_manager.execute(
+    cur = db_manager.execute(
         "INSERT INTO map (name, width, height) VALUES (?, ?, ?)",
         (map_name, map_width, map_height)
     )
+    map_id = cur.lastrowid
     
     # 初始化生成器
-    circle_gen = CircleBuildingAreaGenerator("压力测试圆塔", map_name, 1, db_manager)
-    # 使用用户要求的形式创建RectangleBuildingAreaGenerator实例，使用正确的地图名称
-    rect_gen = RectangleBuildingAreaGenerator("压力测试矩形", map_name=map_name, layer=1, db_manager=db_manager)
-    hex_gen = HexagonBuildingAreaGenerator("压力测试正六边形塔", map_name, 1, db_manager)
+    circle_gen = CircleBuildingAreaGenerator("压力测试圆塔", map_id, 1, db_manager)
+    # 使用用户要求的形式创建RectangleBuildingAreaGenerator实例，使用正确的map_id
+    rect_gen = RectangleBuildingAreaGenerator("压力测试矩形", map_id=map_id, layer=1, db_manager=db_manager)
+    hex_gen = HexagonBuildingAreaGenerator("压力测试正六边形塔", map_id, 1, db_manager)
     
     total_success = 0
     
@@ -168,13 +169,13 @@ def test_building_area_stress():
     # 5. 生成房间区：为每个建筑区增加房间区，建筑区有多高房间区就有多高
     print("\n5. 为所有建筑区生成房间区...")
     room_gen = RoomGenerator(db_manager)
-    success_count = room_gen.generate_and_save_rooms(map_name)
+    success_count = room_gen.generate_and_save_rooms(map_id)
     print(f"✅ 成功为 {success_count} 个建筑区生成了房间区，建筑区有多高房间区就有多高")
     
     # 6. 生成门：为每个房间增加门
     print("\n6. 为所有房间生成门...")
     item_gen = ItemGenerator(db_manager)
-    door_count = item_gen.generate_and_save_doors(map_name)
+    door_count = item_gen.generate_and_save_doors(map_id)
     print(f"✅ 成功为 {door_count} 个房间生成了门")
     
     # 7. 绘制并保存地图
@@ -187,12 +188,11 @@ def test_building_area_stress():
     # 保存组合PDF，按照物品层->房间层->建筑区层的顺序
     print("\n保存组合PDF（物品层->房间层->建筑区层）...")
     combined_pdf_path = visualizer.save_combined_pdf(
-        map_name, 
+        map_id, 
         layers=range(1, 4),  # 3层
         show_grid=True, 
         show_building_areas=True, 
         show_area_names=True,
-        show_rooms=True,  # 现在生成了房间，所以显示房间
         fig_size=(15, 15),
         output_dir=output_dir,
         filename="test_combined_building_stress"  # 指定文件名与程序名对应
@@ -205,7 +205,7 @@ def test_building_area_stress():
     circle_gen.close()
     rect_gen.close()
     hex_gen.close()
-    room_gen.db_manager.close()
+    room_gen.db.close()
     
     print("\n🎉 建筑区与多建筑区压力测试完成！")
 

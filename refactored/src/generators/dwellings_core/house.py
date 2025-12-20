@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
+from collections import deque
+from math import inf
 
 from .rng import RNG
 from .specs import Specs
-from .plan import PlanDivider
-from .shape import Edge  # Edge 是 plan.py 里 inner_walls 的元素类型
+from .plan import PlanDivider, spawn_windows_excluding
+from .shape import Edge, outline_edges, contour2area  # Edge 是 plan.py 里 inner_walls 的元素类型
+from .footprint import irregularize_area_by_notches, get_notch_cut, apply_notch_if_valid
 
 Cell = Tuple[int, int]
 EdgeKey = Tuple[str, int, int]  # ("V", x, y) or ("H", x, y)
@@ -288,17 +291,28 @@ def validate_plan_export(plan_export: Dict[str, Any]) -> None:
     area = plan_export.get("area_cells") or []
     area_set: Set[Cell] = set((int(x), int(y)) for x, y in area)
 
+    terrace = plan_export.get("terrace_cells") or []
+    terrace_set: Set[Cell] = set((int(x), int(y)) for x, y in terrace)
+
     rooms = plan_export.get("rooms") or []
     room_map: Dict[int, Set[Cell]] = {}
     for r in rooms:
         rid = int(r["id"])
+        rtype = (r.get("type") or "generic").lower()
         cells = r.get("cells") or []
         s = set((int(x), int(y)) for x, y in cells)
         if not s:
             raise ValueError(f"room {rid} has no cells")
-        if not s.issubset(area_set):
-            bad = next(iter(s - area_set))
-            raise ValueError(f"room {rid} cell not in area_cells: {bad}")
+
+        if rtype == "terrace":
+            if not s.issubset(terrace_set):
+                bad = next(iter(s - terrace_set))
+                raise ValueError(f"terrace room {rid} cell not in terrace_cells: {bad}")
+        else:
+            if not s.issubset(area_set):
+                bad = next(iter(s - area_set))
+                raise ValueError(f"room {rid} cell not in area_cells: {bad}")
+
         if rid in room_map:
             raise ValueError(f"duplicate room id: {rid}")
         room_map[rid] = s
@@ -335,12 +349,400 @@ def validate_plan_export(plan_export: Dict[str, Any]) -> None:
         if tuple(ek) not in boundary_edges:
             raise ValueError(f"window edge_key not on boundary: {ek}")
 
+def _area_centroid(area: Set[Cell]) -> Tuple[float, float]:
+    if not area:
+        return (0.0, 0.0)
+    sx = sum(x + 0.5 for x, _ in area)
+    sy = sum(y + 0.5 for _, y in area)
+    n = len(area)
+    return (sx / n, sy / n)
+
+
+def _find_stair_core_cells(area: Set[Cell], rng: RNG) -> Set[Cell]:
+    """
+    找一个“楼梯 core”，优先 2x2；找不到就降级到 1x2；再不行就单格。
+    返回的是要永远保留的 cells 集合。
+    """
+    if not area:
+        return set()
+
+    cx, cy = _area_centroid(area)
+
+    # 1) 2x2
+    cand_2x2: List[Tuple[float, Set[Cell]]] = []
+    for (x, y) in area:
+        core = {(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)}
+        if core.issubset(area):
+            # 距离中心越近越好
+            dx = (x + 1.0) - cx
+            dy = (y + 1.0) - cy
+            cand_2x2.append((dx * dx + dy * dy, core))
+    if cand_2x2:
+        cand_2x2.sort(key=lambda t: t[0])
+        # 同分随机扰动一下，避免总是同一个
+        best_d = cand_2x2[0][0]
+        best = [c for d, c in cand_2x2 if abs(d - best_d) < 1e-9]
+        return set(rng.choice(best))
+
+    # 2) 1x2
+    cand_1x2: List[Tuple[float, Set[Cell]]] = []
+    for (x, y) in area:
+        core_h = {(x, y), (x + 1, y)}
+        core_v = {(x, y), (x, y + 1)}
+        for core in (core_h, core_v):
+            if core.issubset(area):
+                dx = (x + 0.5) - cx
+                dy = (y + 0.5) - cy
+                cand_1x2.append((dx * dx + dy * dy, core))
+    if cand_1x2:
+        cand_1x2.sort(key=lambda t: t[0])
+        best_d = cand_1x2[0][0]
+        best = [c for d, c in cand_1x2 if abs(d - best_d) < 1e-9]
+        return set(rng.choice(best))
+
+    # 3) 单格
+    # 选离中心最近的那一格
+    best_cell = None
+    best_dist = inf
+    for (x, y) in area:
+        dx = (x + 0.5) - cx
+        dy = (y + 0.5) - cy
+        d = dx * dx + dy * dy
+        if d < best_dist:
+            best_dist = d
+            best_cell = (x, y)
+    return {best_cell} if best_cell else set()
+
+def _manhattan(a: Cell, b: Cell) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def terrace_outer_boundary_cells(terrace: Set[Cell], lower: Set[Cell]) -> Set[Cell]:
+    """
+    露台的“外边界”cell：它有至少一个邻居不在 lower footprint 中，说明贴着建筑外缘。
+    """
+    out: Set[Cell] = set()
+    for (x, y) in terrace:
+        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+            if (x + dx, y + dy) not in lower:
+                out.add((x, y))
+                break
+    return out
+
+
+def bfs_path_on_cells(allowed: Set[Cell], start: Cell, goal: Cell) -> List[Cell]:
+    if start == goal:
+        return [start]
+    q = deque([start])
+    prev: Dict[Cell, Optional[Cell]] = {start: None}
+
+    while q:
+        x, y = q.popleft()
+        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+            nb = (x + dx, y + dy)
+            if nb in allowed and nb not in prev:
+                prev[nb] = (x, y)
+                if nb == goal:
+                    q.clear()
+                    break
+                q.append(nb)
+
+    if goal not in prev:
+        return []
+
+    path: List[Cell] = []
+    cur: Optional[Cell] = goal
+    while cur is not None:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()
+    return path
+
+
+def _pick_boundary_start_goal(boundary: Set[Cell], core_cells: Set[Cell], rng: RNG) -> Tuple[Cell, Cell]:
+    """
+    start: 距离楼梯 core 最近的 boundary cell
+    goal: 远离 start 的 boundary cell（用曼哈顿距离近似）
+    """
+    b_list = list(boundary)
+    core_list = list(core_cells) if core_cells else [(b_list[0])]
+
+    # start
+    best_s = b_list[0]
+    best_d = 10**9
+    for b in b_list:
+        d = min(_manhattan(b, c) for c in core_list)
+        if d < best_d:
+            best_d = d
+            best_s = b
+
+    # goal
+    best_g = best_s
+    best_gd = -1
+    for b in b_list:
+        d = _manhattan(b, best_s)
+        if d > best_gd:
+            best_gd = d
+            best_g = b
+
+    # 小随机扰动：有同距离的就随机一下
+    far = [b for b in b_list if _manhattan(b, best_s) == best_gd]
+    if far:
+        best_g = rng.choice(far)
+
+    return best_s, best_g
+
+
+def _try_apply_one_notch(
+    rng: RNG,
+    area: Set[Cell],
+    lower_n: int,
+    core: Set[Cell],
+    *,
+    min_ratio: float,
+    min_cells: int,
+    notch_width_range: Tuple[int, int],
+    notch_depth_range: Tuple[int, int],
+) -> Optional[Set[Cell]]:
+    cut = get_notch_cut(
+        area,
+        rng,
+        notch_width_range=notch_width_range,
+        notch_depth_range=notch_depth_range,
+    )
+    if not cut:
+        return None
+    # 绝不切到 core
+    if core and (cut & core):
+        return None
+
+    new_area = apply_notch_if_valid(area, cut, min_cells=min_cells)
+    if new_area is None:
+        return None
+
+    if core and (not core.issubset(new_area)):
+        return None
+
+    if len(new_area) < max(min_cells, int(lower_n * min_ratio)):
+        return None
+
+    # 必须真的“退台”：至少少掉 1 格
+    if len(new_area) >= len(area):
+        return None
+
+    return new_area
+
+
+def _generate_setback_by_notches(
+    rng: RNG,
+    lower_area_cells: List[Cell],
+    core_cells: Set[Cell],
+    *,
+    min_ratio: float = 0.65,
+    min_cells: int = 10,
+    notch_attempts: int = 40,
+    max_notches: int = 3,
+    notch_width_range: Tuple[int, int] = (2, 5),
+    notch_depth_range: Tuple[int, int] = (2, 6),
+) -> List[Cell]:
+    """
+    在 lower footprint 上做 1..N 次 notch 裁切，得到 upper footprint。
+    约束：
+    - upper >= min_ratio * lower
+    - 保留 core_cells
+    - 形状保持连通（apply_notch_if_valid 已保证）
+    - 尽量保证出现缩进（否则走 fallback）
+    """
+    lower_set: Set[Cell] = set(lower_area_cells)
+    area: Set[Cell] = set(lower_area_cells)
+    lower_n = len(lower_set)
+
+    if lower_n < min_cells:
+        return list(area)
+
+    target_notches = rng.randint(1, max(1, int(max_notches)))
+    made = 0
+
+    for _ in range(notch_attempts):
+        if made >= target_notches:
+            break
+        new_area = _try_apply_one_notch(
+            rng,
+            area,
+            lower_n,
+            core_cells,
+            min_ratio=min_ratio,
+            min_cells=min_cells,
+            notch_width_range=notch_width_range,
+            notch_depth_range=notch_depth_range,
+        )
+        if new_area is None:
+            continue
+        area = new_area
+        made += 1
+
+    # fallback：如果一次都没咬到，强制用更小 notch 再试一轮，尽量保证“稳定出现退台”
+    if area == lower_set:
+        for _ in range(notch_attempts):
+            new_area = _try_apply_one_notch(
+                rng,
+                area,
+                lower_n,
+                core_cells,
+                min_ratio=min_ratio,
+                min_cells=min_cells,
+                notch_width_range=(2, 2),
+                notch_depth_range=(2, 2),
+            )
+            if new_area is not None:
+                area = new_area
+                break
+
+    return sorted(list(area))
+
+def _connected_components(cells: Set[Cell]) -> List[Set[Cell]]:
+    comps: List[Set[Cell]] = []
+    seen: Set[Cell] = set()
+    for c in cells:
+        if c in seen:
+            continue
+        q = deque([c])
+        seen.add(c)
+        comp = {c}
+        while q:
+            x, y = q.popleft()
+            for nx, ny in _neighbors4(x, y):
+                nb = (nx, ny)
+                if nb in cells and nb not in seen:
+                    seen.add(nb)
+                    comp.add(nb)
+                    q.append(nb)
+        comps.append(comp)
+    return comps
+
+
+def _pick_farthest_seeds(rng: RNG, cells: List[Cell], k: int) -> List[Cell]:
+    # 简单 farthest-point sampling
+    seeds = [rng.choice(cells)]
+    while len(seeds) < k:
+        best = None
+        best_d = -1
+        for c in cells:
+            d = min(abs(c[0]-s[0]) + abs(c[1]-s[1]) for s in seeds)
+            if d > best_d:
+                best_d = d
+                best = c
+        seeds.append(best if best is not None else rng.choice(cells))
+    return seeds
+
+
+def _split_connected_area_into_k(rng: RNG, comp: Set[Cell], k: int) -> List[Set[Cell]]:
+    # 关键：只用“从已有格子扩张”的方式分配，保证每个子房间连通
+    k = max(1, int(k))
+    cells = list(comp)
+    if k <= 1 or len(cells) <= k:
+        return [set(comp)]
+
+    seeds = _pick_farthest_seeds(rng, cells, k)
+    regions = [set([s]) for s in seeds]
+    owner: Dict[Cell, int] = {s: i for i, s in enumerate(seeds)}
+    fronts = [deque([s]) for s in seeds]
+    unassigned = set(comp) - set(seeds)
+
+    while unassigned:
+        progressed = False
+        order = list(range(k))
+        rng.shuffle(order)
+        for i in order:
+            if not fronts[i]:
+                continue
+            x, y = fronts[i].popleft()
+            for nx, ny in _neighbors4(x, y):
+                nb = (nx, ny)
+                if nb in unassigned:
+                    unassigned.remove(nb)
+                    owner[nb] = i
+                    regions[i].add(nb)
+                    fronts[i].append(nb)
+                    progressed = True
+        if progressed:
+            continue
+
+        # 卡住时：随便挑一个未分配格，把它塞给它任意一个已分配邻居所属的 region
+        u = next(iter(unassigned))
+        assigned_neighbor = None
+        for nx, ny in _neighbors4(u[0], u[1]):
+            nb = (nx, ny)
+            if nb in owner:
+                assigned_neighbor = nb
+                break
+        if assigned_neighbor is None:
+            # 理论上不会发生（comp 连通），兜底
+            regions[0].update(unassigned)
+            break
+        i = owner[assigned_neighbor]
+        unassigned.remove(u)
+        owner[u] = i
+        regions[i].add(u)
+        fronts[i].append(u)
+
+    # 清理空集
+    regions = [r for r in regions if r]
+    return regions
+
+
+def _split_terrace_into_rooms(rng: RNG, terrace_set: Set[Cell]) -> List[Set[Cell]]:
+    rooms: List[Set[Cell]] = []
+    for comp in _connected_components(terrace_set):
+        n = len(comp)
+        # 你可以按喜好调阈值：越小越容易分裂出“相邻露台房间”
+        if n < 20:
+            k = 1
+        elif n < 60:
+            k = 2
+        else:
+            k = 3
+        rooms.extend(_split_connected_area_into_k(rng, comp, k))
+    return rooms
+
+def _inner_walls_and_candidates_from_room_sets(
+    rooms: List[Set[Cell]],
+) -> Tuple[Dict[int, List[EdgeKey]], Dict[Tuple[int, int], List[EdgeKey]]]:
+    owner: Dict[Cell, int] = {}
+    for rid, s in enumerate(rooms, start=1):
+        for c in s:
+            owner[c] = rid
+
+    inner_by_room: Dict[int, Set[EdgeKey]] = {rid: set() for rid in range(1, len(rooms) + 1)}
+    cand: Dict[Tuple[int, int], Set[EdgeKey]] = {}
+
+    # 扫描右/下邻居避免重复
+    for (x, y), r1 in owner.items():
+        for nb in [(x + 1, y), (x, y + 1)]:
+            r2 = owner.get(nb)
+            if not r2 or r2 == r1:
+                continue
+            ek = _edge_key_between((x, y), nb)
+            if ek is None:
+                continue
+            inner_by_room[r1].add(ek)
+            inner_by_room[r2].add(ek)
+            a, b = (r1, r2) if r1 < r2 else (r2, r1)
+            cand.setdefault((a, b), set()).add(ek)
+
+    inner_out = {rid: sorted(list(s)) for rid, s in inner_by_room.items()}
+    cand_out = {k: sorted(list(s)) for k, s in cand.items()}
+    return inner_out, cand_out
+
+def _should_generate_setback(tags: List[str], n_floors: int) -> bool:
+    if "slab" in tags:
+        return False
+    return n_floors > 1
 
 # -------------------------
 # public API
 # -------------------------
-def generate_house_export(
-    *,
+def generate_house_export(    *,
     seed: int,
     tags: List[str],
     area_cells: List[Tuple[int, int]],
@@ -349,7 +751,23 @@ def generate_house_export(
     base_rng = RNG(int(seed))
 
     area_cells_norm: List[Cell] = [(int(x), int(y)) for x, y in area_cells]
-    area_set = set(area_cells_norm)
+    
+    # ✅ Step2：先改 footprint（不规则 + 凹口）
+    area_cells_norm = irregularize_area_by_notches(
+        area_cells_norm,
+        base_rng,
+        max_notches=3,
+    )
+    
+    # 轮廓回填归一化：确保形状稳定，便于后续处理
+    cont = outline_edges(set(area_cells_norm))
+    area_cells_norm = contour2area(cont)
+
+    # ✅ 选一个“楼梯 core”，后续楼层退台必须保留它
+    base_area_set = set(area_cells_norm)
+    core_cells = _find_stair_core_cells(base_area_set, base_rng)
+
+    # grid size（用底层算就行）
     grid_w, grid_h = _grid_size_from_cells(area_cells_norm)
 
     specs_obj = Specs.from_tags(tags)
@@ -358,76 +776,174 @@ def generate_house_export(
     floors: List[Dict[str, Any]] = []
     n_floors = max(1, int(n_floors))
 
+    generate_setback = _should_generate_setback(tags, n_floors)
+
+    # ✅ 默认有露台；传 no_terrace 才禁用
+    allow_terrace = ("no_terrace" not in tags)
+
+    # ✅ 每层 footprint 预先算好
+    floor_areas: List[List[Cell]] = [area_cells_norm.copy()]
+    for floor_i in range(1, n_floors):
+        if generate_setback:
+            rng = RNG(base_rng._next_u32() ^ (floor_i * 0x9E3779B9))
+            upper_area = _generate_setback_by_notches(
+                rng,
+                floor_areas[-1],
+                core_cells,
+                min_ratio=0.65,
+                max_notches=3,
+            )
+            # ✅ 再做一次轮廓回填，保持边界稳定
+            cont_u = outline_edges(set(upper_area))
+            upper_area = contour2area(cont_u)
+            floor_areas.append(upper_area)
+        else:
+            floor_areas.append(floor_areas[-1].copy())
+
     for floor_i in range(n_floors):
         rng = RNG(base_rng._next_u32() ^ (floor_i * 0x9E3779B9))
-
+        
+        # Use the area for this floor (may have setback)
+        current_area = floor_areas[floor_i]
+        current_area_set = set(current_area)
+        
         divider = PlanDivider(rng, specs_obj)
-        res = divider.divide(set(area_cells_norm))
+        res = divider.divide(current_area_set)
 
-        target_k = specs_obj.target_rooms(len(area_cells_norm))
-        rooms_list = _reduce_rooms_to_target(rng, list(res.rooms), target_k)
+        rooms_list = list(res.rooms)  # 原版风格：divide() 出来多少就多少
 
         room_cells: Dict[int, List[Cell]] = {
             rid: sorted(list(cset))
             for rid, cset in enumerate(rooms_list, start=1)
         }
 
-        inner_by_room, door_cand = _inner_walls_by_room_and_candidates(
-            area_set, rooms_list, res.inner_walls
-        )
+        # ✅ terrace：上层露台 = 下层 footprint - 本层 footprint
+        terrace_area: List[Cell] = []
+        terrace_rooms: List[Set[Cell]] = []
+        if floor_i > 0 and generate_setback and allow_terrace:
+            lower_set = set(floor_areas[floor_i - 1])
+            cur_set = set(floor_areas[floor_i])
+            # ✅ terrace：上层露台 = 下层 footprint - 本层 footprint（但不要内凹被包裹的块）
+            terrace_area: List[Cell] = []
+            terrace_rooms: List[Set[Cell]] = []
 
-        boundary = _boundary_edges(area_set)
-        if boundary:
-            ek, inner = rng.choice(boundary)
-            entrance = {"edge_key": list(ek), "cell": [int(inner[0]), int(inner[1])]}
-        else:
-            entrance = {"edge_key": None, "cell": None}
+            if floor_i > 0 and generate_setback and allow_terrace:
+                lower_set = set(floor_areas[floor_i - 1])
+                cur_set = set(floor_areas[floor_i])
+                terrace_raw = lower_set - cur_set
 
+                if terrace_raw:
+                    # 露台“触外”的边界cell（内凹被完全包裹的区域不会触外）
+                    outer_cells = terrace_outer_boundary_cells(terrace_raw, lower_set)
+
+                    keep: Set[Cell] = set()
+                    for comp in _connected_components(terrace_raw):
+                        # 只保留包含“触外边界cell”的连通块
+                        if comp & outer_cells:
+                            keep |= comp
+
+                    terrace_area = sorted(list(keep))
+
+                    # ✅ 不分割：每个连通块就是一个 terrace room
+                    terrace_rooms = _connected_components(keep) if keep else []
+
+
+        # rooms_all：室内 + 露台房间（露台拆成多个房间）
+        rooms_all: List[Set[Cell]] = list(rooms_list) + list(terrace_rooms)
+
+        room_cells: Dict[int, List[Cell]] = {
+            rid: sorted(list(cset))
+            for rid, cset in enumerate(rooms_all, start=1)
+        }
+
+        # ✅ 室内门（保持原逻辑）
+        inner_by_room_indoor, door_cand = _inner_walls_and_candidates_from_room_sets(rooms_list)
         doors_export = _select_doors_min_connectivity(
-            rng, room_cells, door_cand, connectivity=float(specs_obj.connectivity)
+            rng,
+            {rid: sorted(list(cset)) for rid, cset in enumerate(rooms_list, start=1)},
+            door_cand,
+            connectivity=float(specs_obj.connectivity),
         )
 
-        windows_export: List[Dict[str, Any]] = []
-        if boundary:
-            boundary_edges = [ek for (ek, _inner) in boundary]
-            if entrance.get("edge_key"):
-                ent = tuple(entrance["edge_key"])
-                boundary_edges = [ek for ek in boundary_edges if ek != ent]
-            boundary_edges = list(dict.fromkeys(boundary_edges))
-            rng.shuffle(boundary_edges)
+        # ✅ 露台门：每个露台房间至少 1 扇，连接到相邻的室内房间
+        if terrace_rooms:
+            owner_indoor = _build_cell_owner_from_rooms(rooms_list)  # (x,y)->indoor rid
+            indoor_n = len(rooms_list)
 
-            wd = specs_obj.window_density_for_floor(n_floors, floor_i)
-            wd = max(0.0, min(0.5, float(wd)))
-            n_win = int(len(boundary_edges) * wd)
-            n_win = max(0, min(n_win, int(specs_obj.window_cap)))
+            for ti, tset in enumerate(terrace_rooms):
+                terrace_rid = indoor_n + ti + 1
 
-            for ek in boundary_edges[:n_win]:
-                windows_export.append({"edge_key": list(ek), "length": 1})
+                # candidates: indoor_rid -> [edge_key...]
+                cand_to_indoor: Dict[int, List[EdgeKey]] = {}
 
-        rooms_export: List[Dict[str, Any]] = []
+                for (x, y) in tset:
+                    for nb in _neighbors4(x, y):
+                        if nb not in current_area_set:  # 只允许贴着本层室内 footprint 的地方开门
+                            continue
+                        indoor_rid = owner_indoor.get(nb)
+                        if not indoor_rid:
+                            continue
+                        ek = _edge_key_between((x, y), nb)
+                        if ek is None:
+                            continue
+                        cand_to_indoor.setdefault(int(indoor_rid), []).append(ek)
+
+                # 如果这个露台块完全没有贴着室内(只角接触或孤岛)，就不给它生成门
+                if not cand_to_indoor:
+                    continue
+
+                # 选“共享边最多”的室内房间
+                best_indoor = max(cand_to_indoor.items(), key=lambda kv: len(kv[1]))[0]
+                ek = rng.choice(cand_to_indoor[best_indoor])
+
+                doors_export.append({
+                    "edge_key": list(ek),
+                    "r1": int(best_indoor),
+                    "r2": int(terrace_rid),
+                    "door_type": "TERRACE",
+                    "price": float(len(cand_to_indoor[best_indoor])),
+                })
+
+        # ✅ 把 inner_walls_by_room 补全到 rooms_all，露台房间给空列表
+        inner_by_room = {rid: inner_by_room_indoor.get(rid, []) for rid in range(1, len(rooms_all) + 1)}
+
+        # Default values for required export fields
+        entrance = {}
+        windows_export = []
+        stairs_export = []
+
+        # rooms_export：按 rid 判定是否为 terrace（室内数量 = len(rooms_list)）
+        rooms_export = []
+        indoor_n = len(rooms_list)
         for rid in sorted(room_cells.keys()):
             cells = room_cells[rid]
             if not cells:
                 continue
+            is_terrace = (rid > indoor_n)
+            rtype = "terrace" if is_terrace else "generic"
+            rname = f"Terrace_{rid - indoor_n:02d}" if is_terrace else f"Room_{rid}"
             rooms_export.append({
                 "id": int(rid),
-                "type": "generic",
-                "name": f"Room_{rid}",
+                "type": rtype,
+                "name": rname,
                 "cells": [[int(x), int(y)] for (x, y) in cells],
                 "narrow": [],
                 "contour": None,
             })
 
+
         plan_export: Dict[str, Any] = {
             "floor_index": int(floor_i),
             "grid_w": int(grid_w),
             "grid_h": int(grid_h),
-            "area_cells": [[int(x), int(y)] for (x, y) in area_cells_norm],
+            "area_cells": [[int(x), int(y)] for (x, y) in current_area],
+            "terrace_cells": [[int(x), int(y)] for (x, y) in terrace_area],
+            "stair_core_cells": [[int(x), int(y)] for (x, y) in sorted(core_cells)],
             "entrance": entrance,
             "rooms": rooms_export,
             "doors": doors_export,
             "windows": windows_export,
-            "stairs": [],
+            "stairs": stairs_export,
             "inner_walls_by_room": {int(rid): [list(ek) for ek in eks] for rid, eks in inner_by_room.items()},
             "inner_walls": [
                 [[int(e.a[0]), int(e.a[1]), int(e.b[0]), int(e.b[1])] for e in chain]
@@ -443,4 +959,7 @@ def generate_house_export(
         "tags": list(tags),
         "specs": specs,
         "floors": floors,
+        "has_setback": bool(generate_setback),
+        "n_floors": int(n_floors),
+        "stair_core_cells": [[int(x), int(y)] for (x, y) in sorted(core_cells)],
     }

@@ -241,3 +241,101 @@ def find_edge_by_start(contour: List[Edge], node: Node) -> Optional[Edge]:
         if e.a == node:
             return e
     return None
+
+
+# ---------- Step2: contour -> area (robust, outside flood fill) ----------
+from collections import deque
+from typing import Deque
+
+# undirected edge key on integer grid nodes: (ax,ay,bx,by) with (a<=b)
+EdgeSegKey = Tuple[int, int, int, int]
+
+
+def _edgekey_from_nodes(a: Node, b: Node) -> EdgeSegKey:
+    (ax, ay), (bx, by) = a, b
+    if (ax, ay) <= (bx, by):
+        return (ax, ay, bx, by)
+    return (bx, by, ax, ay)
+
+
+def edge_undirected_key(e: Edge) -> EdgeSegKey:
+    return _edgekey_from_nodes(e.a, e.b)
+
+
+def cell_ndir2edge_key(cell: Cell, d: Dir) -> EdgeSegKey:
+    """
+    返回 cell 朝 d 方向的“边界边”(无向 key)，用于判断该边是否在 contour 上
+    cell=(x,y) 覆盖 [x,x+1]x[y,y+1]
+    """
+    x, y = cell
+    if d == Dir.NORTH:
+        return _edgekey_from_nodes((x, y), (x + 1, y))
+    if d == Dir.SOUTH:
+        return _edgekey_from_nodes((x, y + 1), (x + 1, y + 1))
+    if d == Dir.WEST:
+        return _edgekey_from_nodes((x, y), (x, y + 1))
+    if d == Dir.EAST:
+        return _edgekey_from_nodes((x + 1, y), (x + 1, y + 1))
+    raise ValueError(f"Unknown dir: {d}")
+
+
+def contour2area(contour: List[Edge]) -> List[Cell]:
+    """
+    更稳的 contour2area：从外部做 flood fill，contour 边当“墙”，
+    bbox 内没被 flood 到的 cell 就是 inside area。
+
+    这更贴近 Dwellings.js 里“边界阻挡 + 填充”的思想，
+    不依赖 clockwise 判断，也不需要猜 inside 起点。
+    """
+    if not contour:
+        return []
+
+    wall_keys: Set[EdgeSegKey] = {edge_undirected_key(e) for e in contour}
+
+    xs = [e.a[0] for e in contour] + [e.b[0] for e in contour]
+    ys = [e.a[1] for e in contour] + [e.b[1] for e in contour]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+
+    # inside candidate cells are x in [minx..maxx-1], y in [miny..maxy-1]
+    in_minx, in_maxx = minx, maxx - 1
+    in_miny, in_maxy = miny, maxy - 1
+
+    # expanded bounds for outside flood
+    ex_minx, ex_maxx = minx - 1, maxx
+    ex_miny, ex_maxy = miny - 1, maxy
+
+    def in_expanded(c: Cell) -> bool:
+        x, y = c
+        return ex_minx <= x <= ex_maxx and ex_miny <= y <= ex_maxy
+
+    start: Cell = (ex_minx, ex_miny)
+    q: Deque[Cell] = deque([start])
+    outside: Set[Cell] = {start}
+
+    while q:
+        x, y = q.popleft()
+        for d in (Dir.NORTH, Dir.EAST, Dir.SOUTH, Dir.WEST):
+            nx, ny = x + d.dx, y + d.dy
+            nb = (nx, ny)
+            if not in_expanded(nb) or nb in outside:
+                continue
+
+            # 被 contour 边挡住就不能过
+            ek = cell_ndir2edge_key((x, y), d)
+            if ek in wall_keys:
+                continue
+
+            outside.add(nb)
+            q.append(nb)
+
+    inside: List[Cell] = []
+    for x in range(in_minx, in_maxx + 1):
+        for y in range(in_miny, in_maxy + 1):
+            c = (x, y)
+            if c not in outside:
+                inside.append(c)
+
+    # 稳定排序，便于复现
+    inside.sort()
+    return inside

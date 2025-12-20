@@ -56,101 +56,79 @@ class MapVisualizer:
 
     # ---------------- db fetch ----------------
 
-    def get_map_info(self, map_id):
-        """
-        通过 map_id 获取地图信息
-        """
+    def get_map_info(self, map_name):
         result = self.db_manager.fetch_one(
-            "SELECT name, width, height FROM map WHERE id = ?",
-            (int(map_id),)
+            "SELECT name, width, height FROM map WHERE name = ?",
+            (map_name,)
         )
         if result:
-            return {"name": result["name"], "width": int(result["width"]), "height": int(result["height"])}
+            return {"name": result[0], "width": int(result[1]), "height": int(result[2])}
         return None
 
-    def _fetch_rooms(self, map_id, layer_index):
+    def _fetch_rooms(self, map_name, layer_index):
         query = """
-        SELECT name, tiles_json, geom_json
+        SELECT name, wall_grid_list, space_grid_list, inner_wall_grid_list, vector_params
         FROM room
-        WHERE map_id = ? AND layer_start <= ? AND layer_end >= ?
+        WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?
         """
-        rows = self.db_manager.fetch_all(query, (int(map_id), layer_index, layer_index))
+        rows = self.db_manager.fetch_all(query, (map_name, layer_index, layer_index))
 
         rooms = []
         for row in rows:
-            name = row["name"]
-            tiles_json = row["tiles_json"]
-            geom_json = row.get("geom_json")
-
+            name, wall_s, space_s, inner_s, vec_s = row
             try:
-                tiles = json.loads(tiles_json) if tiles_json else {}
-            except Exception:
-                tiles = {}
-
-            try:
-                vec = json.loads(geom_json) if geom_json else {}
-            except Exception:
-                vec = {}
-
-            rooms.append({
-                "name": name,
-                "wall": tiles.get("wall", []),
-                "space": tiles.get("space", []),
-                "inner_wall": tiles.get("inner_wall", []),
-                "door": [],           # 门仍从 item 表读
-                "vector": vec,        # ✅ 关键
-            })
-        return rooms
-
-
-    def _fetch_door_tiles(self, map_id, layer_index):
-        query = """
-        SELECT tiles_json
-        FROM item
-        WHERE map_id = ? AND item_type = 'door'
-        AND layer_start <= ? AND layer_end >= ?
-        """
-        rows = self.db_manager.fetch_all(query, (int(map_id), layer_index, layer_index))
-
-        door_tiles = []
-        for row in rows:
-            try:
-                tj = json.loads(row["tiles_json"]) if row["tiles_json"] else {}
-                wt = tj.get("wall_tiles", [])
-                if isinstance(wt, list):
-                    door_tiles.extend(wt)
+                rooms.append({
+                    "name": name,
+                    "wall": json.loads(wall_s) if wall_s else [],
+                    "space": json.loads(space_s) if space_s else [],
+                    "inner_wall": json.loads(inner_s) if inner_s else [],
+                    "door": [],  # 初始为空，后续从item表填充
+                    "vector": json.loads(vec_s) if vec_s else {},
+                })
             except Exception as e:
-                print(f"解析 door tiles_json 出错: {e}")
-        return door_tiles
-
-
-    def _fetch_building_areas(self, map_id, layer_index):
-        query = """
-        SELECT name, geom_type, center_x, center_y, radius, geom_json
-        FROM building_area
-        WHERE map_id = ? AND layer_start <= ? AND layer_end >= ?
+                print(f"解析房间 '{name}' JSON 出错: {e}")
+        return rooms
+        
+    def _fetch_doors(self, map_name, layer_index):
         """
-        rows = self.db_manager.fetch_all(query, (int(map_id), layer_index, layer_index))
-
-        building_areas = []
+        从item表读取门数据
+        """
+        query = """
+        SELECT container_room, properties
+        FROM item
+        WHERE map_name = ? AND type = 'door' AND min_layer <= ? AND max_layer >= ?
+        """
+        rows = self.db_manager.fetch_all(query, (map_name, layer_index, layer_index))
+        
+        doors_by_room = {}
         for row in rows:
-            name = row["name"]
-            geom_type = row["geom_type"]
-            cx, cy = row.get("center_x"), row.get("center_y")
-            radius = row.get("radius")
-            geom_json = row.get("geom_json")
+            room_name, props_s = row
+            try:
+                props = json.loads(props_s)
+                wall_tiles = props.get("wall_tiles", [])
+                if room_name not in doors_by_room:
+                    doors_by_room[room_name] = []
+                doors_by_room[room_name].extend(wall_tiles)
+            except Exception as e:
+                print(f"解析门数据出错: {e}")
+        
+        return doors_by_room
+    
+    def _merge_doors_into_rooms(self, rooms, doors_by_room):
+        """
+        将从item表读取的门数据合并到房间列表中
+        """
+        for room in rooms:
+            room_name = room["name"]
+            if room_name in doors_by_room:
+                room["door"] = doors_by_room[room_name]
 
-            if geom_type == "circle":
-                position = [float(cx or 0.0), float(cy or 0.0)]
-                corner_str = str(float(radius or 0.0))  # 给 _draw_building_areas 当半径
-                building_areas.append((name, json.dumps(position), "circle", corner_str, "[]"))
-            else:
-                # geom_json 里就是 corners: [[x,y],...]
-                corner_str = geom_json or "[]"
-                building_areas.append((name, json.dumps([0, 0]), geom_type, corner_str, "[]"))
-
-        return building_areas
-
+    def _fetch_building_areas(self, map_name, layer_index):
+        return self.db_manager.fetch_all(
+            "SELECT name, position, type, corner, size FROM building_areas "
+            "WHERE map_name = ? AND min_layer <= ? AND max_layer >= ?",
+            (map_name, layer_index, layer_index)
+        )
 
     # ---------------- masks + imshow helpers ----------------
 
@@ -292,20 +270,9 @@ class MapVisualizer:
                             sum(p[0] for p in corners) / len(corners),
                             sum(p[1] for p in corners) / len(corners),
                         ]
-                elif "bbox" in vec and isinstance(vec["bbox"], list) and len(vec["bbox"]) == 4:
-                    x1, y1, x2, y2 = vec["bbox"]
-                    rect = patches.Rectangle(
-                        (x1, y1), x2 - x1, y2 - y1,
-                        facecolor=room_vector_color,
-                        edgecolor="blue",
-                        linewidth=1.0,
-                        zorder=zorder
-                    )
-                    ax.add_patch(rect)
-                    if "center" in vec:
-                        center = vec["center"]
-                    else:
-                        center = [(x1 + x2) / 2.0, (y1 + y2) / 2.0]
+                else:
+                    # 兜底：如果没有矢量 corners，就不画
+                    pass
 
                 if show_room_names:
                     ax.text(
@@ -353,7 +320,7 @@ class MapVisualizer:
 
     def draw_map(
         self,
-        map_id,
+        map_name,
         layer_index=1,
         fig_size=(10, 10),
         show_grid=True,
@@ -373,12 +340,12 @@ class MapVisualizer:
     ):
         """
         绘制单张地图（单层级）
-        - layer_order: e.g. ["building_areas","room_vector","room_grid","item_vector","item_grid"]
+        - layer_order: e.g. ["building_areas","room_grid","room_vector","item_grid","item_vector"]
         """
 
-        map_info = self.get_map_info(map_id)
+        map_info = self.get_map_info(map_name)
         if not map_info:
-            print(f"错误: 找不到 map_id 为 {map_id} 的地图")
+            print(f"错误: 找不到名为 '{map_name}' 的地图")
             return None
 
         W = map_info["width"]
@@ -417,8 +384,6 @@ class MapVisualizer:
         ax.set_ylim(0, H)
         ax.set_aspect("equal")
 
-        # 使用 map_info["name"] 作为标题
-        map_name = map_info["name"]
         if self.chinese_font:
             ax.set_title(f"{map_name} - 层级 {layer_index}", fontproperties=self.chinese_font)
         else:
@@ -445,10 +410,13 @@ class MapVisualizer:
 
         needs_rooms = enabled[self.L_ROOM_GRID] or enabled[self.L_ROOM_VECTOR] or enabled[self.L_ITEM_GRID] or enabled[self.L_ITEM_VECTOR]
         if needs_rooms:
-            rooms = self._fetch_rooms(map_id, layer_index)
+            rooms = self._fetch_rooms(map_name, layer_index)
+            # 从item表获取门数据并合并到房间中
+            doors_by_room = self._fetch_doors(map_name, layer_index)
+            self._merge_doors_into_rooms(rooms, doors_by_room)
 
         if enabled[self.L_BUILDING]:
-            building_areas = self._fetch_building_areas(map_id, layer_index)
+            building_areas = self._fetch_building_areas(map_name, layer_index)
 
         # 掩码（按需）
         floor_mask = wall_mask = inner_wall_mask = door_mask = None
@@ -470,11 +438,9 @@ class MapVisualizer:
                     self._stamp_mask(wall_mask, r["wall"], W, H)
                     self._stamp_mask(inner_wall_mask, r["inner_wall"], W, H)
 
-                # ✅ 从 item 表把 door 的 wall_tiles 盖进 door_mask
+                # 物品格子层需要：door
                 if enabled[self.L_ITEM_GRID] or enabled[self.L_ITEM_VECTOR]:
-                    door_tiles = self._fetch_door_tiles(map_id, layer_index)
-                    self._stamp_mask(door_mask, door_tiles, W, H)
-
+                    self._stamp_mask(door_mask, r["door"], W, H)
 
         # 逐层渲染（按 layer_order 决定叠放）
         base_z = 10
@@ -532,7 +498,7 @@ class MapVisualizer:
 
     def save_map_by_layer(
         self,
-        map_id,
+        map_name,
         layers=None,
         output_dir="地图输出",
         formats=("png", "pdf"),
@@ -542,23 +508,20 @@ class MapVisualizer:
         # draw_map 参数透传
         **draw_kwargs
     ):
-        """
-        通过 map_id 保存每层地图
-        """
         if layers is None:
             max_layer = self.db_manager.fetch_one(
-                "SELECT MAX(layer_end) FROM building_area WHERE map_id = ?",
-                (int(map_id),)
+                "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
+                (map_name,)
             )
-            max_layer = max_layer["layer_end"] if max_layer and max_layer["layer_end"] else 3
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3
             layers = range(1, max_layer + 1)
 
         for layer in layers:
-            fig = self.draw_map(map_id, layer_index=layer, fig_size=fig_size, **draw_kwargs)
+            fig = self.draw_map(map_name, layer_index=layer, fig_size=fig_size, **draw_kwargs)
             if fig:
                 self.save_map(
                     fig,
-                    f"map{map_id}_层{layer}",
+                    f"{map_name}_层{layer}",
                     formats=list(formats),
                     output_dir=output_dir,
                     dpi=dpi,
@@ -567,7 +530,7 @@ class MapVisualizer:
 
     def save_multi_layer_pdf(
         self,
-        map_id,
+        map_name,
         layers=None,
         output_dir="地图输出",
         fig_size=(10, 10),
@@ -583,20 +546,20 @@ class MapVisualizer:
         """
         if layers is None:
             max_layer = self.db_manager.fetch_one(
-                "SELECT MAX(layer_end) FROM building_area WHERE map_id = ?",
-                (int(map_id),)
+                "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
+                (map_name,)
             )
-            max_layer = max_layer["layer_end"] if max_layer and max_layer["layer_end"] else 3
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3
             layers = range(1, max_layer + 1)
 
         os.makedirs(output_dir, exist_ok=True)
 
-        safe_name = (filename or f"map{map_id}").replace(" ", "_")
+        safe_name = (filename or map_name).replace(" ", "_")
         pdf_path = os.path.join(output_dir, f"{safe_name}_多层.pdf")
 
         with PdfPages(pdf_path) as pdf:
             for layer in layers:
-                fig = self.draw_map(map_id, layer_index=layer, fig_size=fig_size, **draw_kwargs)
+                fig = self.draw_map(map_name, layer_index=layer, fig_size=fig_size, **draw_kwargs)
                 if fig:
                     if tight_bbox:
                         pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
@@ -609,7 +572,7 @@ class MapVisualizer:
 
     def save_combined_pdf(
         self,
-        map_id,
+        map_name,
         layers=None,
         output_dir="地图输出",
         fig_size=(10, 10),
@@ -623,17 +586,52 @@ class MapVisualizer:
         """
         组合 PDF（强力版）：
         - 你可以用 page_specs 定义“页的顺序”和“每页用哪些层、层的叠放顺序”。
+
+        page_specs 示例（顺序就是页顺序）：
+        [
+          {
+            "title": "物品+房间+建筑区（全）",
+            "draw_kwargs": {
+                "layer_order": [...],
+                "show_item_grid": True,
+                "show_item_vector": True,
+                "show_room_grid": True,
+                "show_room_vector": True,
+                "show_building_areas": True,
+            }
+          },
+          {
+            "title": "仅房间（不画门）",
+            "draw_kwargs": {
+                "show_item_grid": False,
+                "show_item_vector": False,
+                "show_room_grid": True,
+                "show_room_vector": True,
+                "show_building_areas": True,
+            }
+          },
+          {
+            "title": "仅建筑区",
+            "draw_kwargs": {
+                "show_room_grid": False,
+                "show_room_vector": False,
+                "show_item_grid": False,
+                "show_item_vector": False,
+                "show_building_areas": True,
+            }
+          },
+        ]
         """
         if layers is None:
             max_layer = self.db_manager.fetch_one(
-                "SELECT MAX(layer_end) FROM building_area WHERE map_id = ?",
-                (int(map_id),)
+                "SELECT MAX(max_layer) FROM building_areas WHERE map_name = ?",
+                (map_name,)
             )
-            max_layer = max_layer["layer_end"] if max_layer and max_layer["layer_end"] else 3
+            max_layer = max_layer[0] if max_layer and max_layer[0] else 3
             layers = range(1, max_layer + 1)
 
         os.makedirs(output_dir, exist_ok=True)
-        safe_filename = (filename or f"map{map_id}").replace(" ", "_")
+        safe_filename = (filename or map_name).replace(" ", "_")
         pdf_path = os.path.join(output_dir, f"{safe_filename}.pdf")
 
         # 默认：只输出一组“当前 draw_kwargs”的页面（每层级一页）
@@ -649,12 +647,8 @@ class MapVisualizer:
                 draw_kwargs.update(spec.get("draw_kwargs", {}))
 
                 for layer in layers:
-                    fig = self.draw_map(map_id, layer_index=layer, fig_size=fig_size, **draw_kwargs)
+                    fig = self.draw_map(map_name, layer_index=layer, fig_size=fig_size, **draw_kwargs)
                     if fig:
-                        # 使用地图名称作为标题
-                        map_info = self.get_map_info(map_id)
-                        map_name = map_info["name"] if map_info else f"map{map_id}"
-                        
                         if self.chinese_font:
                             plt.title(f"{map_name} - 层级 {layer}（{title}）", fontproperties=self.chinese_font)
                         else:

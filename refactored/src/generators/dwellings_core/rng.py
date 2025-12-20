@@ -6,20 +6,17 @@ T = TypeVar("T")
 
 @dataclass
 class RNG:
-    """Deterministic RNG (xorshift32). Good enough as a controllable baseline."""
+    """Deterministic RNG (Park-Miller LCG). Matches Dwellings.js implementation."""
     state: int
 
     def _next_u32(self) -> int:
-        x = self.state & 0xFFFFFFFF
-        x ^= (x << 13) & 0xFFFFFFFF
-        x ^= (x >> 17) & 0xFFFFFFFF
-        x ^= (x << 5) & 0xFFFFFFFF
-        self.state = x
-        return x
+        # Park-Miller LCG: seed = (48271*seed) % 2147483647
+        self.state = (48271 * self.state) % 2147483647
+        return self.state & 0xFFFFFFFF
 
     def random(self) -> float:
         # [0,1)
-        return (self._next_u32() & 0xFFFFFFFF) / 2**32
+        return (self._next_u32() & 0x7FFFFFFF) / 2147483647.0
 
     def randint(self, a: int, b: int) -> int:
         if a > b:

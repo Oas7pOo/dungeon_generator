@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Dict, Any
 
 from .shape import (
     Cell, Edge, Dir,
@@ -13,6 +13,8 @@ from .shape import (
 from .rng import RNG
 from .specs import Specs
 
+
+EdgeKey = Tuple[str, int, int]  # ("V", x, y) or ("H", x, y)
 
 def _edge2cell(area: Set[Cell], e: Edge) -> Cell:
     # CW 轮廓：内侧在右；但为了鲁棒，右侧不在 area 就回退左侧
@@ -47,6 +49,54 @@ def is_narrow(area: Set[Cell], c: Cell) -> bool:
         return False
 
     return True
+
+
+def spawn_windows_excluding(
+    rng: RNG,
+    boundary: List[Tuple[EdgeKey, Cell]],
+    doors: List[Dict[str, Any]],
+    stairs: List[Dict[str, Any]],
+    window_density: float,
+    window_cap: int
+) -> List[Dict[str, Any]]:
+    """
+    复刻 Dwellings.js spawnWindowsExcluding 逻辑：
+    - 生成窗户边，避开门、楼梯等
+    - 将窗户边推入返回列表
+    """
+    windows = []
+    
+    # Extract door edges to avoid
+    door_edges = set()
+    for door in doors:
+        door_edge = tuple(door.get("edge_key", []))
+        if door_edge:
+            door_edges.add(door_edge)
+    
+    # Extract stair-related edges to avoid (simplified for now)
+    stair_edges = set()
+    
+    # Get all boundary edges, excluding those near doors/stairs
+    available_edges = []
+    for edge_key, _ in boundary:
+        if edge_key not in door_edges and edge_key not in stair_edges:
+            available_edges.append(edge_key)
+    
+    # Shuffle edges for randomness
+    rng.shuffle(available_edges)
+    
+    # Calculate number of windows based on density
+    n_win = int(len(available_edges) * window_density)
+    n_win = max(0, min(n_win, window_cap))
+    
+    # Generate windows
+    for ek in available_edges[:n_win]:
+        windows.append({
+            "edge_key": list(ek),
+            "length": 1
+        })
+    
+    return windows
 
 
 def get_notch(

@@ -9,9 +9,9 @@ from shapely.ops import unary_union
 
 from ..db.database import DatabaseManager
 
-# 你自己的 core
 from .dwellings_core.tags import parse_tags
-from .dwellings_core.house import generate_house_export  # 你接下来要实现/先写个简化版也行
+from .dwellings_core.house import generate_house_export  
+from .dwellings_core.shape import outline_edges
 
 JsonDict = Dict[str, Any]
 Grid = List[int]          # [x, y]
@@ -29,9 +29,48 @@ class DwellingsHouseDBWriter:
         self.db = db_manager or DatabaseManager()
         self.cell_scale = cell_scale
 
-    # -------------------------
-    # json helpers
-    # -------------------------
+    @staticmethod
+    def _simplify_orth_loop(nodes: list[tuple[int,int]]) -> list[tuple[int,int]]:
+        """
+        把 unit-step 的轮廓点压缩成“拐点序列”，减少 geom_json 体积。
+        nodes 是闭环（不含重复终点），按顺序走。
+        """
+        if len(nodes) <= 4:
+            return nodes
+        out = []
+        n = len(nodes)
+        for i in range(n):
+            px, py = nodes[i - 1]
+            cx, cy = nodes[i]
+            nx, ny = nodes[(i + 1) % n]
+            # 如果 prev-cur-next 共线（同 x 或同 y），cur 是直线中间点，删掉
+            if (px == cx == nx) or (py == cy == ny):
+                continue
+            out.append((cx, cy))
+        return out if len(out) >= 3 else nodes
+
+    def _coarse_cells_to_world_corners(
+        self,
+        cells_coarse: list[tuple[int,int]],
+        origin: tuple[int,int],
+    ) -> list[list[float]]:
+        """
+        用 coarse cells 的外轮廓生成 world corners（细网格坐标系）。
+        corners 落在网格线（整数坐标）上，和 tiles 完全对齐。
+        """
+        area = set((int(x), int(y)) for x, y in cells_coarse)
+        edges = outline_edges(area)
+        if not edges:
+            return []
+
+        nodes = [e.a for e in edges]              # unit-step 轮廓点
+        nodes = self._simplify_orth_loop(nodes)   # 压缩为拐点
+
+        ox, oy = origin
+        s = int(self.cell_scale)
+        corners = [[ox + x * s, oy + y * s] for (x, y) in nodes]
+        return corners
+        
     @staticmethod
     def _dumps(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False)
@@ -359,6 +398,9 @@ class DwellingsHouseDBWriter:
             n_floors=n_floors,
         )
 
+        # 防呆：即使 core 产出 terrace，也只在允许时写入 DB
+        allow_terrace = ("no_terrace" not in tags)
+
         # 2) 写 rooms
         room_db_id_by_local: Dict[Tuple[int, int], int] = {}  # (floor_index, local_room_id) -> db_room_id
         cell2room_local: Dict[Tuple[int, int, int], int] = {} # (floor, x, y) -> local_room_id
@@ -370,9 +412,17 @@ class DwellingsHouseDBWriter:
             L = layer_start + floor_i
 
             rooms_in_plan = plan.get("rooms", []) or []
+            
+            # 建立本层 rid -> room_type 映射
+            room_type_by_local = {int(rr["id"]): str(rr.get("type") or "generic") for rr in rooms_in_plan}
 
             # ----- Pass 0: 先建立本层完整 cell -> local_room_id 映射（必须先做）-----
             for r in rooms_in_plan:
+                # 防呆：不允许 terrace 时跳过 terrace room
+                room_type = str(r.get("type") or "")
+                if not allow_terrace and room_type == "terrace":
+                    continue
+                    
                 local_rid = int(r["id"])
                 cells_coarse = [(int(x), int(y)) for (x, y) in r.get("cells", [])]
                 if not cells_coarse:
@@ -391,6 +441,11 @@ class DwellingsHouseDBWriter:
 
             # ----- Pass 1: 再真正插入 room（这里生成 inner_wall tiles）-----
             for r in rooms_in_plan:
+                # 防呆：不允许 terrace 时跳过 terrace room
+                room_type = str(r.get("type") or "")
+                if not allow_terrace and room_type == "terrace":
+                    continue
+                    
                 local_rid = int(r["id"])
                 cells_coarse = [(int(x), int(y)) for (x, y) in r.get("cells", [])]
                 if not cells_coarse:
@@ -438,8 +493,17 @@ class DwellingsHouseDBWriter:
                     if not rA or not rB or rA == rB:
                         continue
 
-                    # 只让 min(rA,rB) 的房间画这条内墙（避免双层墙）
-                    if local_rid != min(int(rA), int(rB)):
+                    # 修改内墙归属规则：terrace 优先
+                    tA = room_type_by_local.get(int(rA), "generic")
+                    tB = room_type_by_local.get(int(rB), "generic")
+                    if tA == "terrace" and tB != "terrace":
+                        owner_rid = int(rA)
+                    elif tB == "terrace" and tA != "terrace":
+                        owner_rid = int(rB)
+                    else:
+                        owner_rid = min(int(rA), int(rB))
+
+                    if local_rid != owner_rid:
                         continue
 
                     # 这条墙归属哪一侧粗格（属于 local_rid 的那侧）
@@ -475,13 +539,20 @@ class DwellingsHouseDBWriter:
                     space_set.difference_update(inner_wall_tiles_set)
                     space = [[int(x), int(y)] for (x, y) in sorted(space_set)]
 
-                # geom_json：先用 bbox+center，使用粗网格坐标计算
+                # geom_json：使用真实外轮廓多边形（与 tiles 对齐）
                 xs = [x for x, _ in cells_coarse]
                 ys = [y for _, y in cells_coarse]
                 minx, maxx = min(xs), max(xs)
                 miny, maxy = min(ys), max(ys)
-                cx = (minx + maxx + 1) / 2.0
-                cy = (miny + maxy + 1) / 2.0
+                
+                # ✅ 关键：真实外轮廓多边形（与 tiles 对齐）
+                corners = self._coarse_cells_to_world_corners(cells_coarse, origin)
+                
+                # 更精确的中心：用 coarse cell centroid 再乘 scale
+                n = len(cells_coarse)
+                cx_f = sum((x + 0.5) for x, _ in cells_coarse) / max(1, n)
+                cy_f = sum((y + 0.5) for _, y in cells_coarse) / max(1, n)
+                center_world = [origin[0] + cx_f * self.cell_scale, origin[1] + cy_f * self.cell_scale]
 
                 geom_json = {
                     "type": "dwelling_room",
@@ -489,10 +560,19 @@ class DwellingsHouseDBWriter:
                     "display_name": display,
                     "local_floor": floor_i,
                     "local_room_id": local_rid,
-                    "origin": [ox, oy],
-                    "bbox": [ox + minx * self.cell_scale, oy + miny * self.cell_scale, 
-                             ox + (maxx + 1) * self.cell_scale, oy + (maxy + 1) * self.cell_scale],
-                    "center": [ox + (cx * self.cell_scale), oy + (cy * self.cell_scale)],
+                    "origin": [origin[0], origin[1]],
+                    
+                    # ✅ 关键：真实外轮廓多边形（与 tiles 对齐）
+                    "corners": corners,
+                    
+                    # 保留 bbox/center 作为兜底与快速定位
+                    "bbox": [
+                        origin[0] + minx * self.cell_scale,
+                        origin[1] + miny * self.cell_scale,
+                        origin[0] + (maxx + 1) * self.cell_scale,
+                        origin[1] + (maxy + 1) * self.cell_scale,
+                    ],
+                    "center": center_world,
                 }
 
                 tiles_json = {"wall": wall, "space": space, "inner_wall": inner_wall}
@@ -541,6 +621,10 @@ class DwellingsHouseDBWriter:
 
         for floor_i, plan in enumerate(house_export.get("floors", [])):
             L = layer_start + floor_i
+
+            # 建立本层 rid -> room_type 映射（用于门 owner 判定）
+            rooms_in_plan = plan.get("rooms", []) or []
+            room_type_by_local = {int(rr["id"]): str(rr.get("type") or "generic") for rr in rooms_in_plan}
 
             # door
             for idx, d in enumerate(plan.get("doors", []), start=1):
@@ -597,8 +681,17 @@ class DwellingsHouseDBWriter:
                 door_radius = max(0.8, 0.9 * scale / 2)
                 vector = {"type": "circle", "center": [center_x, center_y], "radius": door_radius}
 
-                # ✅ 门挂到 owner 房间
-                db_owner = room_db_id_by_local.get((floor_i, int(r_small)))
+                # ✅ 门挂到 owner 房间：与 inner_wall 同规则（terrace 优先）
+                t1 = room_type_by_local.get(r1, "generic")
+                t2 = room_type_by_local.get(r2, "generic")
+                if t1 == "terrace" and t2 != "terrace":
+                    owner_rid = r1
+                elif t2 == "terrace" and t1 != "terrace":
+                    owner_rid = r2
+                else:
+                    owner_rid = min(r1, r2)
+                
+                db_owner = room_db_id_by_local.get((floor_i, int(owner_rid)))
                 if not db_owner:
                     continue
 
