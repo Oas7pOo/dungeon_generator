@@ -214,7 +214,7 @@ class ItemGenerator:
         item_data: JsonDict = {
             "map_id": map_id,
             "room_id": room_id,
-            "building_area_id": int(room_row["building_area_id"]),
+            "building_area_id": int(room_row["building_area_id"]) if room_row.get("building_area_id") is not None else None,
             "name": f"Door_room{room_id}",
             "item_type": "door",
             "layer_start": int(room_row["layer_start"]),
@@ -372,7 +372,7 @@ class ItemGenerator:
             items.append({
                 "map_id": map_id,
                 "room_id": room_id,
-                "building_area_id": int(room_row["building_area_id"]),
+                "building_area_id": int(room_row["building_area_id"]) if room_row.get("building_area_id") is not None else None,
                 "name": f"Window_room{room_id}_{idx:02d}",
                 "item_type": "window",
                 "layer_start": ls,

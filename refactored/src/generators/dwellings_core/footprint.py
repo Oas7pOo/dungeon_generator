@@ -6,6 +6,89 @@ from .shape import Dir, outline_edges, contour2area
 
 Cell = Tuple[int, int]
 
+def _grow_connected_subset(rng: RNG, envelope: Set[Cell], target_n: int) -> Set[Cell]:
+    env_list = list(envelope)
+    if not env_list:
+        return set()
+
+    # 从靠近中心的点开始，形状更“住宅”
+    cx, cy = _area_centroid(envelope)
+    env_list.sort(key=lambda c: (c[0]+0.5-cx)**2 + (c[1]+0.5-cy)**2)
+    start = env_list[0]
+    chosen = {start}
+
+    frontier = [start]
+    frontier_set = {start}
+
+    while len(chosen) < target_n and frontier:
+        cur = frontier[rng.randint(0, len(frontier)-1)]
+        # 随机扩张方向
+        nbs = _neighbors4(cur[0], cur[1])
+        rng.shuffle(nbs)
+        added = False
+        for nb in nbs:
+            if nb in envelope and nb not in chosen:
+                chosen.add(nb)
+                if nb not in frontier_set:
+                    frontier.append(nb)
+                    frontier_set.add(nb)
+                added = True
+                break
+        if not added:
+            # 这个 frontier 点扩不动了
+            frontier_set.discard(cur)
+            frontier.remove(cur)
+
+    return chosen
+
+
+def _is_too_narrow(area: Set[Cell], min_span: int = 3) -> bool:
+    if not area:
+        return True
+    xs = [x for x,_ in area]; ys = [y for _,y in area]
+    w = max(xs) - min(xs) + 1
+    h = max(ys) - min(ys) + 1
+    if w < min_span or h < min_span:
+        return True
+    # 防止出现 1 格“掐脖子”
+    col_counts = {}
+    row_counts = {}
+    for x,y in area:
+        col_counts[x] = col_counts.get(x,0) + 1
+        row_counts[y] = row_counts.get(y,0) + 1
+    if min(col_counts.values()) <= 1 or min(row_counts.values()) <= 1:
+        return True
+    return False
+
+
+def _make_footprint_from_envelope(
+    rng: RNG,
+    envelope_cells: List[Cell],
+    tags: List[str],
+) -> List[Cell]:
+    envelope = set(envelope_cells)
+    size_class = _size_class_from_tags_or_area(tags, len(envelope))
+    r0, r1 = _target_ratio_range(size_class)
+    target = int(round(len(envelope) * (r0 + (r1 - r0) * rng.random())))
+
+    # 多次尝试，带“太窄就重来”
+    best = None
+    best_score = -1
+    for _ in range(20):
+        fp = _grow_connected_subset(rng, envelope, target)
+        if not fp:
+            continue
+        if _is_too_narrow(fp, min_span=3):
+            score = len(fp) - 9999
+        else:
+            score = len(fp)
+        if score > best_score:
+            best_score = score
+            best = fp
+        if score >= target:
+            break
+
+    return sorted(list(best if best else envelope))
 
 def _is_connected(area: Set[Cell]) -> bool:
     if not area:

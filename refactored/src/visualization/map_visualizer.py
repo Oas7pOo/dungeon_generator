@@ -27,6 +27,26 @@ class MapVisualizer:
 
     ALL_LAYERS = (L_BUILDING, L_ROOM_GRID, L_ROOM_VECTOR, L_ITEM_GRID, L_ITEM_VECTOR)
 
+    # 文字标签统一画在最高层（高于所有掩码/多边形），避免被像素层压住
+    TOP_TEXT_ZORDER = 1000
+
+    # 多层"分层视图"PDF 的页定义（save_multi_view_pdf 使用）
+    # 三种展示层按"堆叠"设计：矢量叠在建筑区上，像素叠在矢量上（底 -> 顶）
+    MULTI_VIEW_ORDER = [
+        ("建筑区展示层",
+         dict(show_building_areas=True, show_room_grid=False, show_room_vector=False,
+              show_item_grid=False, show_item_vector=False,
+              layer_order=[L_BUILDING])),
+        ("矢量展示层",
+         dict(show_building_areas=True, show_room_grid=False, show_room_vector=True,
+              show_item_grid=False, show_item_vector=False,
+              layer_order=[L_BUILDING, L_ROOM_VECTOR])),
+        ("像素展示层",
+         dict(show_building_areas=True, show_room_grid=True, show_room_vector=True,
+              show_item_grid=True, show_item_vector=False,
+              layer_order=[L_BUILDING, L_ROOM_VECTOR, L_ROOM_GRID, L_ITEM_GRID])),
+    ]
+
     def __init__(self, db_manager=None):
         self.db_manager = db_manager or DatabaseManager()
         self._setup_chinese_font()
@@ -126,7 +146,7 @@ class MapVisualizer:
 
     def _fetch_building_areas(self, map_id, layer_index):
         query = """
-        SELECT name, geom_type, center_x, center_y, radius, geom_json
+        SELECT name, geom_type, center_x, center_y, radius, geom_json, size_json
         FROM building_area
         WHERE map_id = ? AND layer_start <= ? AND layer_end >= ?
         """
@@ -139,11 +159,32 @@ class MapVisualizer:
             cx, cy = row.get("center_x"), row.get("center_y")
             radius = row.get("radius")
             geom_json = row.get("geom_json")
+            size_json = row.get("size_json")
 
             if geom_type == "circle":
                 position = [float(cx or 0.0), float(cy or 0.0)]
                 corner_str = str(float(radius or 0.0))  # 给 _draw_building_areas 当半径
                 building_areas.append((name, json.dumps(position), "circle", corner_str, "[]"))
+            elif geom_type == "rectangle" and not geom_json:
+                # 轴对齐矩形不存 geom_json：用 center + size_json 重建 corners
+                try:
+                    size = json.loads(size_json) if size_json else {}
+                    w = float(size.get("width") or 0)
+                    h = float(size.get("height") or 0)
+                    if w > 0 and h > 0 and cx is not None and cy is not None:
+                        hw, hh = w / 2.0, h / 2.0
+                        fx, fy = float(cx), float(cy)
+                        corner_str = json.dumps([
+                            [fx - hw, fy - hh],
+                            [fx + hw, fy - hh],
+                            [fx + hw, fy + hh],
+                            [fx - hw, fy + hh],
+                        ])
+                    else:
+                        corner_str = "[]"
+                except Exception:
+                    corner_str = "[]"
+                building_areas.append((name, json.dumps([0, 0]), "rectangle", corner_str, "[]"))
             else:
                 # geom_json 里就是 corners: [[x,y],...]
                 corner_str = geom_json or "[]"
@@ -198,6 +239,13 @@ class MapVisualizer:
     # ---------------- draw pieces ----------------
 
     def _draw_building_areas(self, ax, building_areas, area_color, show_area_names, zorder):
+        # 轮廓线宽按地图尺度自适应（1200x1200 下 1pt 几乎不可见）
+        try:
+            x0, x1 = ax.get_xlim()
+            lw = max(1.0, (max(abs(x0), abs(x1)) / 400.0))
+        except Exception:
+            lw = 1.0
+
         for area in building_areas:
             name, position_str, area_type, corner_str, size_str = area
 
@@ -214,7 +262,7 @@ class MapVisualizer:
                             position, radius,
                             facecolor=area_color,
                             edgecolor="red",
-                            linewidth=1,
+                            linewidth=lw,
                             zorder=zorder
                         )
                         ax.add_patch(circle)
@@ -223,7 +271,7 @@ class MapVisualizer:
                                 position[0], position[1], name,
                                 ha="center", va="center",
                                 fontsize=8,
-                                zorder=zorder + 0.1,
+                                zorder=self.TOP_TEXT_ZORDER,
                                 **({"fontproperties": self.chinese_font} if self.chinese_font else {})
                             )
                 except Exception as e:
@@ -236,7 +284,7 @@ class MapVisualizer:
                             corners,
                             facecolor=area_color,
                             edgecolor="red",
-                            linewidth=1,
+                            linewidth=lw,
                             zorder=zorder
                         )
                         ax.add_patch(polygon)
@@ -248,7 +296,7 @@ class MapVisualizer:
                                 cx, cy, name,
                                 ha="center", va="center",
                                 fontsize=8,
-                                zorder=zorder + 0.1,
+                                zorder=self.TOP_TEXT_ZORDER,
                                 **({"fontproperties": self.chinese_font} if self.chinese_font else {})
                             )
                 except Exception as e:
@@ -313,7 +361,7 @@ class MapVisualizer:
                         ha="center", va="center",
                         color="blue",
                         fontsize=8,
-                        zorder=zorder + 0.2,
+                        zorder=self.TOP_TEXT_ZORDER,
                         bbox=dict(facecolor="white", edgecolor="none", alpha=0.7),
                         **({"fontproperties": self.chinese_font} if self.chinese_font else {})
                     )
@@ -668,6 +716,70 @@ class MapVisualizer:
                         plt.close(fig)
 
         print(f"✅ 成功保存组合PDF到: {pdf_path}")
+        return pdf_path
+
+    def save_multi_view_pdf(
+        self,
+        map_id,
+        layers=None,
+        output_dir="地图输出",
+        fig_size=(10, 10),
+        filename=None,
+        dpi=150,
+        tight_bbox=False,
+        views=None,
+        # draw_map 参数透传（作为每页默认值，页面级配置覆盖）
+        **default_draw_kwargs
+    ):
+        """
+        多层"分层视图"PDF（每层 3 页，页序 = 层外层、视图内层）：
+
+            层1: 第1页 建筑区展示层 / 第2页 矢量展示层 / 第3页 像素展示层
+            层2: 第4页 建筑区展示层 / 第5页 矢量展示层 / 第6页 像素展示层
+            ...
+
+        三种展示层按"堆叠"设计（从底到顶）：
+            - 建筑区展示层：只画建筑区轮廓
+            - 矢量展示层  ：建筑区 + 房间矢量
+            - 像素展示层  ：建筑区 + 矢量 + 房间像素格子 + 门格子（完整堆叠）
+
+        输出：{filename}_多层视图.pdf（单文件多页，多层放在同一个 PDF 里）
+        """
+        if layers is None:
+            max_layer = self.db_manager.fetch_one(
+                "SELECT MAX(layer_end) FROM building_area WHERE map_id = ?",
+                (int(map_id),)
+            )
+            max_layer = max_layer["layer_end"] if max_layer and max_layer["layer_end"] else 1
+            layers = range(1, int(max_layer) + 1)
+
+        views = views or self.MULTI_VIEW_ORDER
+        os.makedirs(output_dir, exist_ok=True)
+        safe_name = (filename or f"map{map_id}").replace(" ", "_")
+        pdf_path = os.path.join(output_dir, f"{safe_name}_多层视图.pdf")
+
+        with PdfPages(pdf_path) as pdf:
+            for layer in layers:
+                for view_title, view_kw in views:
+                    draw_kwargs = dict(default_draw_kwargs)
+                    draw_kwargs.update(view_kw)
+
+                    fig = self.draw_map(int(map_id), layer_index=int(layer), fig_size=fig_size, **draw_kwargs)
+                    if fig:
+                        map_info = self.get_map_info(map_id)
+                        map_name = map_info["name"] if map_info else f"map{map_id}"
+                        if self.chinese_font:
+                            plt.title(f"{map_name} - 层{layer} - {view_title}", fontproperties=self.chinese_font)
+                        else:
+                            plt.title(f"{map_name} - 层{layer} - {view_title}")
+
+                        if tight_bbox:
+                            pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
+                        else:
+                            pdf.savefig(fig, dpi=dpi)
+                        plt.close(fig)
+
+        print(f"✅ 成功保存多层视图PDF到: {pdf_path}")
         return pdf_path
 
     def close(self):

@@ -27,6 +27,12 @@ class Specs:
     connectivity: float = 0.5
     window_density_base: float = 0.9
     window_density_step: float = 0.1
+    
+    # ---- 从 tags 解析出来的“语义开关”（让下游不再碰 tags）
+    size_hint: str | None = None               # "small"|"medium"|"large"|None
+    window_mode: str = "normal"                # "normal"|"blank"|"transparent"
+    stairs_mode: str = "stairwell"             # "stairwell"|"spiral"
+    allow_terrace: bool = True                 # tags 不含 no_terrace
 
     # ---- 我们目前最简算法的“桥接系数”
     # avg_room_size 在 JS 里不等价于“每房间 cell 数”，为了不爆炸，先用一个缩放系数。
@@ -46,7 +52,26 @@ class Specs:
         prefer_walls = "organic" in ts
         no_nooks = "hallways" not in ts
 
-        # 先保持与 JS 默认值一致的“感觉”（后面你还原 divideArea 时会真正使用这些偏好）
+        # size：Step1 之后 canonical 是 small/medium/large
+        size_hint = None
+        if "small" in ts: size_hint = "small"
+        elif "medium" in ts: size_hint = "medium"
+        elif "large" in ts: size_hint = "large"
+
+        # window mode：把 blank/transparent 收进 specs
+        if "blank" in ts:
+            window_mode = "blank"
+        elif "transparent" in ts:
+            window_mode = "transparent"
+        else:
+            window_mode = "normal"
+
+        # stairs：默认 stairwell（与你 house.py 当前逻辑一致）
+        stairs_mode = "spiral" if "spiral" in ts else "stairwell"
+
+        # terrace：不含 no_terrace 才允许
+        allow_terrace = ("no_terrace" not in ts)
+
         return cls(
             avg_room_size=6.0,
             room_size_chaos=1.0,
@@ -57,6 +82,11 @@ class Specs:
             connectivity=0.5,
             window_density_base=0.9,
             window_density_step=0.1,
+
+            size_hint=size_hint,
+            window_mode=window_mode,
+            stairs_mode=stairs_mode,
+            allow_terrace=allow_terrace,
         )
 
     def window_density_for_floor(self, n_floors: int, floor_index: int) -> float:
@@ -69,6 +99,21 @@ class Specs:
         i = max(0, min(int(floor_index), n - 1))
         wd = self.window_density_base - self.window_density_step * (n - i)
         return _clamp(float(wd), 0.0, 1.0)
+    
+    def infer_size_class(self, envelope_n: int) -> str:
+        """
+        优先使用 tags 给的 size_hint；
+        否则用 envelope 的 cell 数量做自动推断（阈值可调）
+        """
+        if self.size_hint in ("small", "medium", "large"):
+            return self.size_hint
+
+        n = int(envelope_n)
+        if n < 200:
+            return "small"
+        if n < 600:
+            return "medium"
+        return "large"
 
     def target_rooms(self, area_cell_count: int) -> int:
         """

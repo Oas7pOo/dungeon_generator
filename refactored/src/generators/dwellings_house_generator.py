@@ -9,7 +9,7 @@ from shapely.ops import unary_union
 
 from ..db.database import DatabaseManager
 
-from .dwellings_core.tags import parse_tags
+from .dwellings_core.tags import parse_tags, resolve_tags
 from .dwellings_core.house import generate_house_export  
 from .dwellings_core.shape import outline_edges
 
@@ -379,7 +379,7 @@ class DwellingsHouseDBWriter:
         layer_start = int(ba["layer_start"])
         layer_end = int(ba["layer_end"])
 
-        tags = parse_tags(tags_raw)  # canonical tags
+        tags = resolve_tags(parse_tags(tags_raw))  # canonical tags
 
         area_cells, origin = self._area_cells_from_building_area(ba)
         if not area_cells:
@@ -397,6 +397,14 @@ class DwellingsHouseDBWriter:
             area_cells=area_cells,     # 局部坐标
             n_floors=n_floors,
         )
+
+        # Print parity information for debugging
+        parity = house_export.get("_parity")
+        if parity:
+            print(json.dumps(parity, ensure_ascii=False, indent=2))
+
+        # Remove _parity from house_export before writing to DB
+        house_export.pop("_parity", None)
 
         # 防呆：即使 core 产出 terrace，也只在允许时写入 DB
         allow_terrace = ("no_terrace" not in tags)

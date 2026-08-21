@@ -51,52 +51,156 @@ def is_narrow(area: Set[Cell], c: Cell) -> bool:
     return True
 
 
+def _edge_to_edge_key(e: Edge) -> EdgeKey:
+    ax, ay = e.a
+    bx, by = e.b
+    if ax == bx:  # vertical
+        x = int(ax)
+        y = int(min(ay, by))
+        return ("V", x, y)
+    if ay == by:  # horizontal
+        x = int(min(ax, bx))
+        y = int(ay)
+        return ("H", x, y)
+    raise ValueError(f"non axis-aligned edge: {e}")
+
+
+def _weighted_index(rng: RNG, weights: List[int]) -> int:
+    total = sum(weights)
+    if total <= 0:
+        # 兜底：全 0 就均匀选
+        return rng.randint(0, len(weights) - 1)
+    r = rng.random() * total
+    s = 0.0
+    for i, w in enumerate(weights):
+        s += w
+        if r < s:
+            return i
+    return len(weights) - 1
+
+
 def spawn_windows_excluding(
     rng: RNG,
-    boundary: List[Tuple[EdgeKey, Cell]],
-    doors: List[Dict[str, Any]],
-    stairs: List[Dict[str, Any]],
-    window_density: float,
-    window_cap: int
-) -> List[Dict[str, Any]]:
+    contour_edges: List[Edge],
+    *,
+    room_by_cell: Dict[Cell, int],
+    excluded_rooms: Optional[List[int]] = None,
+    blocked_edge_keys: Optional[Set[EdgeKey]] = None,
+    density: float = 0.5,
+    window_mode: str = "normal",                 # 新增
+    tags: Optional[List[str]] = None,            # 兼容旧调用（后面会删）
+) -> List[EdgeKey]:
     """
-    复刻 Dwellings.js spawnWindowsExcluding 逻辑：
-    - 生成窗户边，避开门、楼梯等
-    - 将窗户边推入返回列表
+    JS-like spawnWindowsExcluding:
+    - 按“窗段”抽样，不是按单边
+    - 段权重 = len(segment)^2
+    - 抽到段 => 整段全放窗
+    - blank => 不放窗
+    - transparent => 密度强制 1
     """
-    windows = []
-    
-    # Extract door edges to avoid
-    door_edges = set()
-    for door in doors:
-        door_edge = tuple(door.get("edge_key", []))
-        if door_edge:
-            door_edges.add(door_edge)
-    
-    # Extract stair-related edges to avoid (simplified for now)
-    stair_edges = set()
-    
-    # Get all boundary edges, excluding those near doors/stairs
-    available_edges = []
-    for edge_key, _ in boundary:
-        if edge_key not in door_edges and edge_key not in stair_edges:
-            available_edges.append(edge_key)
-    
-    # Shuffle edges for randomness
-    rng.shuffle(available_edges)
-    
-    # Calculate number of windows based on density
-    n_win = int(len(available_edges) * window_density)
-    n_win = max(0, min(n_win, window_cap))
-    
-    # Generate windows
-    for ek in available_edges[:n_win]:
-        windows.append({
-            "edge_key": list(ek),
-            "length": 1
-        })
-    
-    return windows
+    # 兼容：如果还传了 tags，就用 tags 覆盖 window_mode（旧代码不炸）
+    if tags:
+        if "blank" in tags:
+            window_mode = "blank"
+        elif "transparent" in tags:
+            window_mode = "transparent"
+
+    if window_mode == "blank":
+        return []
+    if window_mode == "transparent":
+        density = 1.0
+
+    density = float(density)
+    if density <= 0:
+        return []
+
+    excluded: Set[int] = set(int(x) for x in (excluded_rooms or []))
+    blocked: Set[EdgeKey] = set(blocked_edge_keys or set())
+
+    # 1) 先算 eligible edge 集合（用于“沿 contour 顺序分段”）
+    eligible_set: Set[EdgeKey] = set()
+    eligible_count = 0
+
+    for e in contour_edges:
+        ek = _edge_to_edge_key(e)
+
+        if ek in blocked:
+            continue
+
+        # contour 是 CW，正常内侧在右；为了鲁棒，右侧没有就回退左侧
+        rc = edge_right_cell(e)
+        rid = room_by_cell.get(rc)
+        if rid is None:
+            lc = edge_left_cell(e)
+            rid = room_by_cell.get(lc)
+
+        if rid is None:
+            continue
+        if rid in excluded:
+            continue
+
+        eligible_set.add(ek)
+        eligible_count += 1
+
+    if eligible_count == 0:
+        return []
+
+    target = eligible_count * density  # JS 是 float，不要先 int
+
+    # 2) 沿 contour 顺序“分段”：同 room + 同 dir + 连续
+    segments: List[List[EdgeKey]] = []
+    cur_seg: List[EdgeKey] = []
+    cur_room: Optional[int] = None
+    cur_dir = None
+
+    for e in contour_edges:
+        ek = _edge_to_edge_key(e)
+        if ek not in eligible_set:
+            if cur_seg:
+                segments.append(cur_seg)
+                cur_seg = []
+            cur_room = None
+            cur_dir = None
+            continue
+
+        rc = edge_right_cell(e)
+        rid = room_by_cell.get(rc)
+        if rid is None:
+            lc = edge_left_cell(e)
+            rid = room_by_cell.get(lc)
+
+        if rid is None:
+            # 理论不该发生，兜底切段
+            if cur_seg:
+                segments.append(cur_seg)
+                cur_seg = []
+            cur_room = None
+            cur_dir = None
+            continue
+
+        if cur_seg and (rid != cur_room or e.dir != cur_dir):
+            segments.append(cur_seg)
+            cur_seg = []
+
+        cur_seg.append(ek)
+        cur_room = rid
+        cur_dir = e.dir
+
+    if cur_seg:
+        segments.append(cur_seg)
+
+    if not segments:
+        return []
+
+    # 3) 按段抽样：权重 len(seg)^2，抽到整段加入
+    picked: List[EdgeKey] = []
+    while segments and (len(picked) < target):
+        weights = [len(seg) * len(seg) for seg in segments]
+        idx = _weighted_index(rng, weights)
+        seg = segments.pop(idx)
+        picked.extend(seg)
+
+    return picked
 
 
 def get_notch(
@@ -320,3 +424,120 @@ class PlanDivider:
 
         rec(set(area))
         return DivideResult(rooms=rooms, inner_walls=inner_walls)
+
+def _is_corridor(room: Set[Cell]) -> bool:
+    # JS: corridor if every cell is narrow in this room
+    # ca.every(room.area, cell in room.narrow)
+    return bool(room) and all(is_narrow(room, c) for c in room)
+
+def _shared_edges_count_upto2(a: Set[Cell], b: Set[Cell]) -> int:
+    """
+    统计两房间共享的“网格边”条数，最多数到 2 就提前退出（因为 JS 只关心 0/1/>1）。
+    """
+    if not a or not b:
+        return 0
+
+    seen: Set[Tuple[Cell, Cell]] = set()
+    cnt = 0
+    for (x, y) in a:
+        # 只要 4 邻域即可
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nb = (x + dx, y + dy)
+            if nb in b:
+                e = ((x, y), nb) if (x, y) < nb else (nb, (x, y))
+                if e in seen:
+                    continue
+                seen.add(e)
+                cnt += 1
+                if cnt > 1:
+                    return cnt
+    return cnt
+
+def merge_corridors_like_js(
+    rooms: List[Set[Cell]],
+    *,
+    stair_room: Optional[Set[Cell]] = None,
+) -> List[Set[Cell]]:
+    """
+    JS 复刻版 mergeCorridors:
+    - corridor = room 内每个 cell 都 is_narrow(room, cell)
+    - 排除 stairwell.room
+    - 只在两 corridor 共享边条数 == 1 时合并
+    - 按 JS 的扫描顺序 do-while 合并，合并出的新房间 append 到末尾
+    """
+    rooms = [set(r) for r in rooms if r]
+
+    corridors: List[Set[Cell]] = []
+    for r in rooms:
+        if stair_room is not None and r == stair_room:
+            continue
+        if _is_corridor(r):
+            corridors.append(r)
+
+    changed = True
+    while changed:
+        changed = False
+        # JS: for a=0..len-2, c=a+1..len-1
+        for i in range(len(corridors) - 1):
+            g = corridors[i]
+            for j in range(i + 1, len(corridors)):
+                q = corridors[j]
+                l = _shared_edges_count_upto2(g, q)
+                if l == 1:
+                    merged = set(g) | set(q)
+
+                    # rooms / corridors 中删除旧房间
+                    rooms.remove(g)
+                    rooms.remove(q)
+                    corridors.pop(j)
+                    corridors.pop(i)
+
+                    # JS: addRoom(...) 后 push 到列表尾部
+                    rooms.append(merged)
+                    corridors.append(merged)
+
+                    changed = True
+                    break
+            if changed:
+                break
+
+    return rooms
+
+def _spawn_windows(rng: RNG, area_set: Set[Cell], entrance_ek: Optional[EdgeKey], density: float) -> List[Dict[str, Any]]:
+    boundary = _boundary_edges(area_set)
+    if not boundary:
+        return []
+    density = max(0.0, min(1.0, float(density)))
+
+    # 以“外墙边数”近似 perimeter
+    n = int(round(len(boundary) * density))
+    if n <= 0:
+        return []
+
+    # 过滤 entrance 边
+    boundary2 = [(ek,c) for ek,c in boundary if (entrance_ek is None or tuple(ek) != tuple(entrance_ek))]
+
+    rng.shuffle(boundary2)
+    chosen = []
+    used_inner = []
+
+    # 做一点“间距”，避免窗挤在一起
+    for ek, c in boundary2:
+        if len(chosen) >= n:
+            break
+        ok = True
+        for uc in used_inner:
+            if abs(c[0]-uc[0]) + abs(c[1]-uc[1]) < 3:
+                ok = False
+                break
+        if not ok:
+            continue
+        chosen.append({"edge_key": list(ek)})
+        used_inner.append(c)
+
+    return chosen
+
+def _stair_kind_from_core(core: Set[Cell]) -> str:
+    if len(core) >= 4:
+        return "spiral"
+    return "stairwell"

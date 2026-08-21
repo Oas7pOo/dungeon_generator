@@ -133,7 +133,7 @@ def test_dwellings_house_writer():
         show_area_names=True,
         fig_size=(15, 15),
         output_dir=output_dir,
-        filename="test_dwellings"
+        filename="test_dwellings2"
     )
     print(f"✅ 可视化PDF已生成: {pdf_path}")
     

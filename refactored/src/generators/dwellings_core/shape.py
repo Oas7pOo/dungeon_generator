@@ -205,35 +205,104 @@ def _orient_loop_interior_right(nodes: List[Node], area: Set[Cell]) -> List[Node
 
 def outline_edges(area: Set[Cell]) -> List[Edge]:
     """
-    返回外轮廓（outer loop）的 CW Edge 列表。
-    先不处理 holes：取绝对面积最大的 loop 当 outer。
+    生成外轮廓（outer loop）的 CW Edge 列表，且对同一个 area 保证确定性。
+    做法：
+      1) 直接生成“带方向”的边界段，方向保证 interior 在右侧（天然 CW）
+      2) 用右手规则在节点上追边形成闭环
+      3) 若存在多个环，取绝对面积最大者为 outer
     """
-    loops = _trace_loops(_boundary_segments(area))
-    if not loops:
+    if not area:
         return []
 
-    def poly_area(ns: List[Node]) -> float:
+    # 1) 生成带方向边界边：interior 在右侧
+    directed: List[Edge] = []
+    for (x, y) in area:
+        # top: (x,y)->(x+1,y) dir=E, right side = SOUTH (interior)
+        if (x, y - 1) not in area:
+            directed.append(Edge(a=(x, y), b=(x + 1, y), dir=Dir.EAST))
+        # right: (x+1,y)->(x+1,y+1) dir=S, right side = WEST (interior)
+        if (x + 1, y) not in area:
+            directed.append(Edge(a=(x + 1, y), b=(x + 1, y + 1), dir=Dir.SOUTH))
+        # bottom: (x+1,y+1)->(x,y+1) dir=W, right side = NORTH (interior)
+        if (x, y + 1) not in area:
+            directed.append(Edge(a=(x + 1, y + 1), b=(x, y + 1), dir=Dir.WEST))
+        # left: (x,y+1)->(x,y) dir=N, right side = EAST (interior)
+        if (x - 1, y) not in area:
+            directed.append(Edge(a=(x, y + 1), b=(x, y), dir=Dir.NORTH))
+
+    if not directed:
+        return []
+
+    # 2) 建 out_map：node -> outgoing edges（确定性排序）
+    # dir 顺序固定，避免 Python set/dict 迭代不稳定
+    dir_order = {Dir.EAST: 0, Dir.SOUTH: 1, Dir.WEST: 2, Dir.NORTH: 3}
+    out_map: Dict[Node, List[Edge]] = {}
+    for e in directed:
+        out_map.setdefault(e.a, []).append(e)
+    for k in out_map:
+        out_map[k].sort(key=lambda e: (e.b[0], e.b[1], dir_order[e.dir]))
+
+    unused: Set[Edge] = set(directed)
+
+    def walk_loop(start: Edge) -> List[Edge]:
+        loop: List[Edge] = []
+        cur = start
+        prev_dir = cur.dir
+        start_node = start.a
+
+        while True:
+            loop.append(cur)
+            unused.discard(cur)
+            node = cur.b
+            if node == start_node:
+                break
+
+            cands = [e for e in out_map.get(node, []) if e in unused]
+            if not cands:
+                break
+
+            # 右手规则：优先右转，再直行，再左转，最后回头
+            pref = [prev_dir.cw, prev_dir, prev_dir.ccw, prev_dir.op]
+            nxt = None
+            for d in pref:
+                for e in cands:
+                    if e.dir == d:
+                        nxt = e
+                        break
+                if nxt is not None:
+                    break
+
+            if nxt is None:
+                nxt = cands[0]
+
+            cur = nxt
+            prev_dir = cur.dir
+
+        return loop
+
+    # 3) 收集所有 loop
+    loops: List[List[Edge]] = []
+    while unused:
+        start = min(
+            unused,
+            key=lambda e: (e.a[0], e.a[1], dir_order[e.dir], e.b[0], e.b[1])
+        )
+        loops.append(walk_loop(start))
+
+    # 4) 取绝对面积最大者作为 outer
+    def loop_area(edges: List[Edge]) -> float:
+        if not edges:
+            return 0.0
+        nodes = [edges[0].a] + [e.b for e in edges]
         s = 0
-        n = len(ns)
-        for i in range(n):
-            x1, y1 = ns[i]
-            x2, y2 = ns[(i + 1) % n]
+        for i in range(len(nodes) - 1):
+            x1, y1 = nodes[i]
+            x2, y2 = nodes[i + 1]
             s += x1 * y2 - x2 * y1
         return s / 2.0
 
-    outer = max(loops, key=lambda ns: abs(poly_area(ns)))
-    outer = _orient_loop_interior_right(outer, area)
-
-    edges: List[Edge] = []
-    n = len(outer)
-    for i in range(n):
-        a = outer[i]
-        b = outer[(i + 1) % n]
-        dx = b[0] - a[0]
-        dy = b[1] - a[1]
-        d = Dir.EAST if dx == 1 else Dir.WEST if dx == -1 else Dir.SOUTH if dy == 1 else Dir.NORTH
-        edges.append(Edge(a=a, b=b, dir=d))
-    return edges
+    outer = max(loops, key=lambda eds: abs(loop_area(eds)))
+    return outer
 
 
 def find_edge_by_start(contour: List[Edge], node: Node) -> Optional[Edge]:
