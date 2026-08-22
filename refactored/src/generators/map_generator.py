@@ -32,6 +32,7 @@ from .building_area_generator import (
 from .room_generator import RoomGenerator
 from .block_room_generator import BlockRoomGenerator
 from .item_generator import ItemGenerator
+from .road_generator import RoadGenerator
 from .dwellings_house_generator import DwellingsHouseDBWriter
 from .map_spec import MapSpec, BuildingAreaSpec
 
@@ -105,8 +106,10 @@ class MapGenerator:
         # 6) 门/窗/楼梯（按 interior 模式去重）
         item_stats = self._generate_items(map_id, spec, warnings=warnings)
 
-        # 7) 连接 / 修饰（规划中）
-        self._warn_planned(warnings, "connection", spec.connection.mode, spec.connection.mode != "none")
+        # 7) 道路连接（按 ConnectionSpec）
+        road_stats = self._generate_roads(map_id, spec, warnings=warnings)
+
+        # 8) 修饰（规划中）
         self._warn_planned(warnings, "decoration", spec.decoration.kind, spec.decoration.kind != "none")
 
         return {
@@ -116,6 +119,7 @@ class MapGenerator:
             "areas": len(area_ids),
             "rooms": rooms,
             "items": item_stats,
+            "roads": road_stats,
             "warnings": warnings,
         }
 
@@ -488,3 +492,44 @@ class MapGenerator:
             warnings.append(
                 f"{dim}.{value} 规划中（未实现），当前跳过"
             )
+
+    # ------------------------------------------------------------------
+    # roads（道路生成，阶段 2）
+    # ------------------------------------------------------------------
+    def _generate_roads(
+        self,
+        map_id: int,
+        spec: MapSpec,
+        *,
+        warnings: List[str],
+    ) -> JsonDict:
+        """
+        按 ConnectionSpec 生成道路路网。
+
+        mode:
+          - none          : 不生成道路
+          - door_to_door  : 门-门相连道路（已实现）
+          - fungus / trunk_branch : 规划中，暂按 door_to_door 生成
+        """
+        mode = spec.connection.mode
+        if mode == "none":
+            return {"roads": 0, "connected": True, "components": [], "warnings": []}
+
+        if mode in ("fungus", "trunk_branch"):
+            warnings.append(f"connection.{mode} 规划中，暂按 door_to_door 生成")
+
+        kw = spec.connection.kwargs or {}
+        width = int(kw.get("width", 5))
+        layer = int(kw.get("layer", 1))
+
+        gen = RoadGenerator(self.db)
+        try:
+            result = gen.generate_and_save_roads(map_id, layer=layer, width=width)
+            if result.get("warnings"):
+                warnings.extend(result["warnings"])
+            return result
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            warnings.append(f"道路生成失败: {e}")
+            return {"roads": 0, "connected": False, "components": [], "warnings": [str(e)]}

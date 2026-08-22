@@ -158,11 +158,15 @@ dungenMap/
 - `passability.py`：`PassabilityIndex(db).is_walkable(map_id, layer, x, y)`
 
 ### 规划中的新生成器（见路线图）
-- `RoomSubdivider` / `RoomGrower`（膨胀接触分割）/ `RowHouseGenerator` / `TempleGenerator` / `FractureEroder`
-- `RoadGenerator`（含连通性模式与桥）
-- `CaveGenerator`（侵蚀/溶蚀/不规则）
+- `RowHouseGenerator` / `TempleGenerator` / `FractureEroder` / `CaveGenerator`
 - `ObjectGenerator`（水/石 item）
 - `WaterSystem`（河流/瀑布/廊坊整合）
+
+### 已落地的增强（阶段 1/2 进展）
+- `RoomSubdivider`（`room_subdivider.py`）：矩形房间 BSP 递归二分 → 子房间 + 共享单墙内墙 + 内部门。
+  **经验**：BSP 嵌套切分后相邻 region 起点不同，内部门检测必须按"共享边距离=1 且投影范围重叠"判断
+  （`a.x1+1==b.x0` 且 y 范围重叠），不能用"同起点"判断。
+- `RoadGenerator` 稠密/稀疏分层 + 兜底外墙 + 门口复用（见 §2.8）。
 
 ---
 
@@ -338,6 +342,66 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 
 - 输入：`(map_id, layer, connectivity_mode)`、该层所有 door item、所有 building_area 几何、**可走区域**
 - 可走区域：`BuildingAreaGenerator._largest_free_polygon_for_layer`（地图 − 建筑区）**再减去水体/岩石占格**（可通行性，见 §0.2 与 §4.4）
+
+#### 2.8 已落地的道路实现经验（v2，重要）
+
+- **道路贴墙走（共用外墙）**：路径规划障碍 = **仅房间 space**（墙不是障碍）。
+  道路带可以贴着房间外墙走、与房屋共用外墙，只禁止覆盖房间内部 space；
+  `road_space = 带 − 所有房间格`（墙格保留在房间，不重复画）。这是密集布局下路网能否连通的**关键**。
+- **稠密按大建筑区分组（v2.2，用户修正）**：稠密路网**只连接同一大建筑区内的房间/区内道路**
+  （`dense_groups` 参数：按大建筑区分组的房间列表）；
+  跨建筑区连接**只留给稀疏阶段**——否则"区内不稠密、区际反而稠密"（用户观察到的颠倒）。
+  mega 验证：区内 10 直连 + 16 接入（稠密），跨区仅 9 条（稀疏 MST）。
+- **路径障碍 = 纯内部格（space − wall）**：basic 模型 wall ⊂ space（墙格同时也是 space 格），
+  若把整个 space 当障碍，带贴墙走时覆盖墙线会被误判冲突（房间 25 孤立的根因）。
+  墙格允许被道路带覆盖（道路可与房屋共用外墙），只禁止覆盖房间**内部**格。
+- **稠密路网算法（用户规则）**：不是"每房间连固定度"——
+  - 每个房间尝试连接所有**不同分量**的目标（房间或道路），最近优先；
+  - **避免冗余**：已连通的房间/道路不再重复连接（b2 已连 b1，则 r1/r2（都连 b1）也不再连）；
+  - **门口复用**：一个房间的多条道路从**同一门洞分叉**（不重复开门），`_insert_door` 幂等（每房间一个 road_entrance 门）；
+- **门洞幂等复用（v2.3）**：`_ensure_exterior_door` 检查该房间是否已有 road_entrance 门，
+  有则**复用同一门洞**（不挖新洞）——否则每次连接都挖洞会造成"墙上多洞/空洞/一墙多门"
+  （门洞挖了但 `_insert_door` 幂等跳过 -> 空洞）。实测每房间恰好 1 门。
+- **门 = 半径覆盖（v2.3，用户规则）**：门洞 = 以"交界处原点"（洞中心）为圆心、
+  半径 = 路宽/2 覆盖到的**外墙格**——覆盖到的外墙都是门（渲染黄色区块与洞一致）。
+- **每房间最多 3 个外联门（v2.4，设定 1）**：一个建筑区建筑只有 ≤3 个往外联通的门
+  （走廊/内室不算）；`_ensure_exterior_door` 已有 ≥3 门则复用，`_insert_door` 按门洞匹配幂等。
+  实测：每房间门数 max 3。
+- **道路折角 ≤6（v2.4，设定 2）**：直线 / L(1折) / Z/S(2折) / C(2折) 之外，
+  0/1/2 折角全失败时用 **A* 避让路径**兜底（墙可走、房间内部格为障碍），压缩后折角 ≤6。
+- **优先更直（v2.5，用户反馈）**：候选路径按生成顺序（直线 → L 形1折 → Z 形2折）依次尝试，
+  **不随机打乱**——此前 `rng.shuffle` 会选出"折两次"的路径即使直线/L 形也能到达。
+  实测：96% 道路为 1 折 L 形，仅少量需 2 折避让。
+- **兜底外墙模型感知（v2.3）**：`_ensure_outer_walls` 直接判定 space 边界格是否被墙隔开
+  （自身是墙 / 外侧邻格是墙 / 门洞入口），缺失才补内边缘墙——
+  不依赖易误判的"wall 是否在 space 内"检测，避免双圈墙与漏补。
+- 一轮尝试完所有目标，迭代直到稠密集全连通或无法进展（"不一定全需要连接成功"）。
+- **交叉截断（v2.1，用户规则）**：路径穿过已有道路时**截断到第一个真交叉**——
+  新道路只到第一条被穿过的道路为止（connects = (起点, 该道路)），不再穿过多条道路形成混杂交叉
+  （b1→r1→r2→b2 只留 b1→r1）；稠密时若截断接入的道路已与起点连通则放弃（b1 不能自己连自己）。
+- **门口共享不算交叉**：两条路从同一门出发在门口外（门洞向外 ROAD_WIDTH 格）重叠一段是正常的，
+  该区域内与已有道路的重叠不记录为交叉（`_door_zone`）。
+- **端点对去重**：同一 (起点, 终点) 连接只生成一次；被重复截断成同一条路时计数
+  （如 b1 连 b2/b3/b4 都被 r1 截断成 b1→r1），计数达阈值（4）**停止该房间的所有尝试**。
+- **子群互联**：稀疏后仍有多个分量时，用**最近的一对不同分量的道路**连接子群
+  （道路之间空地多、阻挡少），连接同样走交叉截断。
+- **外墙判定**：只有**有外墙**的房间才直接连路网（`_has_exterior_wall`）；
+  最大建筑分割的内部子房间无外墙，通过**内部门**互通、由边缘子房间接入路网。
+- **`_door_exterior_point` 关键修复**：外侧方向必须按"洞格邻格不在 space 且其反方向邻格在 space"
+  （垂直于墙朝外）判断——basic 模型 wall ⊂ space，洞格沿墙邻格也在 space，
+  若按"邻格在 space 即内侧"会把沿墙方向误判为内侧，导致道路带从错误点出发覆盖房间自己、
+  路径全失败（孤立房间的根因）。
+- **稀疏路网**：只需连通（每轮连最近不同分量，MST 式 + 道路互联），不需要稠密；
+  独立子网出现时子网道路再与主网道路互联。
+- **兜底外墙机制**：路网生成后对每个房间，space 的 8 邻不在 space 的格必须是墙
+  （缺失的墙格除 door 洞外补入 wall）——保证"房间内区域与外界之间永远有外墙隔开"
+  （`_ensure_outer_walls`，mega 地图实测补墙 1300+ 格）。
+- **道路矢量渲染**：road 的 `geom_json` 含 `path`（中心线），可视化器沿 path 画**折线**（线宽≈路宽），
+  而非 bbox 矩形——矢量跟着路的形状。
+- **区内建筑 = 房间而非嵌套 building_area**：大建筑区内的 5-10 个建筑是 `room`（building_area_id=父建筑区），
+  **不插入 building_area**——保证建筑区之间零重叠（嵌套建筑区会导致 building_area 互相"重叠"）。
+- **尺度**：道路宽 5 + 门半径 2 + 房间 30x40 时，地图需 160x300 级别；间距不足会导致
+  带 5 宽路径全冲突（表现为大量不连通分量）。
 - 避障规则：
   - 跨区道路带不与 building_area / water / stone 相交；
   - 区内道路带被所属 building_area 多边形 `covers`；
@@ -510,7 +574,9 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 | 可通行性基础 | ✅ | `src/generators/passability.py`：`PassabilityIndex.is_walkable(map_id, layer, x, y)`（room space 可走；water/stone 占格不可走；按层缓存） |
 | RNG 种子化 | ✅（零侵入） | `MapGenerator` 入口 `random.seed` + `np.random.seed`；dwellings 用自身 RNG 派生种子；同配方同 seed 复现已测试 |
 | 兼容性修复 | ✅ | `item_generator.py`：`building_area_id=None` 的房间（Watabou 全图模式）生成门/窗不再崩溃 |
-| 测试 | ✅ | `test/test_map_spec.py` 5 项全过；既有测试无回归（`test_block_room.py` / `test_regular_rect.py` / `test_dwellings_room_generator.py` / `test_generator.py` 等为**预先存在**的旧 V1 API 测试，未迁移，与本阶段无关） |
+| 房间分割器 | ✅ | `RoomSubdivider`：BSP 二分 + 共享单墙内墙 + 内部门（mega 地图：最大建筑分割 5 房、7 内部门） |
+| 道路稠密/稀疏分层 | ✅ | `RoadGenerator`：稠密（避免冗余 + 门口复用）+ 稀疏（MST）+ 兜底外墙 + 道路矢量折线（§2.8） |
+| 测试 | ✅ | `test/test_map_spec.py` 6 项 + `test/test_road_generator.py` 3 项全过；既有测试无回归 |
 
 **阶段 0 剩余待办**：建筑区入口点（entrance）概念、坐标统一工具抽取、道路避障几何工具整理（见 §7.2-4/6/7）。
 

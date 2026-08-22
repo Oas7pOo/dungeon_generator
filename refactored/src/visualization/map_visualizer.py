@@ -310,7 +310,16 @@ class MapVisualizer:
             center = vec.get("center", [0, 0])
 
             try:
-                if room_type == "circle":
+                if room_type == "road" and isinstance(vec.get("path"), list) and len(vec["path"]) >= 2:
+                    # 道路矢量：沿拐点（waypoints）画简洁折线（跟着路的形状，非 bbox 矩形）
+                    px = [p[0] + 0.5 for p in vec["path"]]
+                    py = [p[1] + 0.5 for p in vec["path"]]
+                    lw = float(vec.get("width", 5)) * 0.8
+                    ax.plot(px, py, color="blue", linewidth=lw, solid_capstyle="round",
+                            zorder=zorder)
+                    center = vec.get("center", [px[len(px) // 2], py[len(py) // 2]])
+
+                elif room_type == "circle":
                     radius = vec.get("radius", 0)
                     if radius > 0:
                         circle = patches.Circle(

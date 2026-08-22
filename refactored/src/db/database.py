@@ -163,6 +163,12 @@ class DatabaseManager:
             if version in applied:
                 continue
 
+            # 迁移期间临时关闭外键约束。
+            # 某些迁移需要重建表（DROP TABLE + CREATE + RENAME），会触发 FK 检查。
+            # PRAGMA foreign_keys 只能在事务外设置，因此必须在 self.begin() 之前关闭，
+            # 在事务结束（commit/rollback）后于 finally 中重新开启。
+            self.conn.execute("PRAGMA foreign_keys = OFF")
+
             self.begin()
             try:
                 fn(self)
@@ -174,6 +180,8 @@ class DatabaseManager:
             except Exception:
                 self.rollback()
                 raise
+            finally:
+                self.conn.execute("PRAGMA foreign_keys = ON")
 
     # -------------------------
     # V2 convenience methods (id-first)
