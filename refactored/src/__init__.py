@@ -3,6 +3,7 @@ from .generators.room_generator import RoomGenerator
 from .generators.block_room_generator import BlockRoomGenerator
 from .generators.item_generator import ItemGenerator
 from .generators.road_generator import RoadGenerator
+from .generators.road_style_generator import RoadStyleGenerator
 from .generators.room_subdivider import RoomSubdivider
 from .generators.passability import PassabilityIndex
 from .generators.map_spec import MapSpec, BuildingAreaSpec, InteriorSpec, ConnectionSpec, DecorationSpec, PRESETS
@@ -22,6 +23,7 @@ __all__ = [
     'BlockRoomGenerator',
     'ItemGenerator',
     'RoadGenerator',
+    'RoadStyleGenerator',
     'RoomSubdivider',
     'PassabilityIndex',
     'MapSpec',

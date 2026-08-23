@@ -508,7 +508,8 @@ class MapGenerator:
 
         mode:
           - none          : 不生成道路
-          - door_to_door  : 门-门相连道路（已实现）
+          - door_to_door  : 已实现。kwargs 无 style -> RoadGenerator v2（折角折线，§2.8）；
+                           kwargs 有 style         -> RoadStyleGenerator（直角/弯曲 × 稠密/稀疏）
           - fungus / trunk_branch : 规划中，暂按 door_to_door 生成
         """
         mode = spec.connection.mode
@@ -518,13 +519,45 @@ class MapGenerator:
         if mode in ("fungus", "trunk_branch"):
             warnings.append(f"connection.{mode} 规划中，暂按 door_to_door 生成")
 
+        # kwargs 透传 RoadGenerator 选项（机制内部化：生成器在 src/，这里只做配置与调用）
         kw = spec.connection.kwargs or {}
+        style = kw.get("style")
+        if style in ("直角", "弯曲"):
+            return self._generate_roads_style(map_id, spec, kw, str(style), warnings)
+        return self._generate_roads_polyline(map_id, spec, kw, warnings)
+
+    def _generate_roads_polyline(
+        self,
+        map_id: int,
+        spec: MapSpec,
+        kw: Dict[str, Any],
+        warnings: List[str],
+    ) -> JsonDict:
+        """折角折线路网（RoadGenerator v2）：直线→L→Z/C 折线，A* 兜底折角 ≤ max_turns。"""
         width = int(kw.get("width", 5))
         layer = int(kw.get("layer", 1))
+        seed = kw.get("seed")                     # None -> 由 RoadGenerator 内部取（受全局 seed 约束）
+        dense_room_ids = kw.get("dense_room_ids") # 稠密阶段房间列表（区内多连）
+        dense_groups = kw.get("dense_groups")     # 按大建筑区分组的稠密房间（区内稠密、区际留给稀疏）
+        dense_degree = int(kw.get("dense_degree", 2))  # 稠密阶段每房间连最近 n 个
+        max_turns = int(kw.get("max_turns", 6))   # A* 兜底最大折角数
+        only_room_ids = kw.get("only_room_ids")   # 限定参与连接的房间（如区内折角 / 区际代表门）
+        astar_max_steps = int(kw.get("astar_max_steps", 80000))  # A* 兜底展开上限（大地图长路调大）
 
         gen = RoadGenerator(self.db)
         try:
-            result = gen.generate_and_save_roads(map_id, layer=layer, width=width)
+            result = gen.generate_and_save_roads(
+                map_id,
+                layer=layer,
+                width=width,
+                seed=seed,
+                dense_room_ids=dense_room_ids,
+                dense_groups=dense_groups,
+                dense_degree=dense_degree,
+                max_turns=max_turns,
+                only_room_ids=only_room_ids,
+                astar_max_steps=astar_max_steps,
+            )
             if result.get("warnings"):
                 warnings.extend(result["warnings"])
             return result
@@ -533,3 +566,93 @@ class MapGenerator:
             traceback.print_exc()
             warnings.append(f"道路生成失败: {e}")
             return {"roads": 0, "connected": False, "components": [], "warnings": [str(e)]}
+
+    def _generate_roads_style(
+        self,
+        map_id: int,
+        spec: MapSpec,
+        kw: Dict[str, Any],
+        style: str,
+        warnings: List[str],
+    ) -> JsonDict:
+        """
+        直角/弯曲路网（RoadStyleGenerator）：在现有房间上开门，按
+        style（直角/弯曲）× density（稠密/稀疏）连路。
+        选项：width / seed / density / dense_k。
+        """
+        from .road_style_generator import RoadStyleGenerator
+
+        density = str(kw.get("density", "稀疏"))
+        width = int(kw.get("width", 5))
+        seed = kw.get("seed")
+        dense_k = int(kw.get("dense_k", 3))   # 稠密：每建筑连最近 n 个（RoadStyleGenerator 默认 3）
+
+        gen = RoadStyleGenerator(self.db, map_id, seed=seed)
+        gen.map_w, gen.map_h = int(spec.width), int(spec.height)
+
+        # 现有房间作为"建筑"（basic/watabou/dwellings 输出均适用）
+        rows = self.db.fetch_all(
+            "SELECT id, name, geom_json, tiles_json FROM room WHERE map_id = ? "
+            "AND (room_type IS NULL OR room_type != 'road')",
+            (int(map_id),),
+        ) or []
+        buildings: List[Dict[str, Any]] = []
+        for r in rows:
+            buildings.append({"id": int(r["id"]), "name": str(r.get("name") or f"B{int(r['id'])}"),
+                              "center": self._room_center_fast(r)})
+        if len(buildings) < 2:
+            warnings.append("直角/弯曲路网需要 ≥2 个房间")
+            return {"roads": 0, "connected": True, "components": [], "warnings": warnings}
+
+        gen.build_obstacles(buildings)
+        doors = [gen.make_door(b, blocked=gen.obstacles) for b in buildings]
+        door_by_bid = {b["id"]: d for b, d in zip(buildings, doors) if d is not None}
+        if len(door_by_bid) < 2:
+            warnings.append("直角/弯曲路网开门失败（<2 个门）")
+            return {"roads": 0, "connected": False, "components": [], "warnings": warnings}
+
+        area = {
+            "area_id": None,
+            "buildings": buildings,
+            "doors": doors,
+            "door_by_bid": door_by_bid,
+            "bbox": (0, 0, gen.map_w, gen.map_h),
+            "center": [
+                sum(b["center"][0] for b in buildings) / len(buildings),
+                sum(b["center"][1] for b in buildings) / len(buildings),
+            ],
+        }
+        n, _ = gen.connect_area(area, doors, style, density, width, rng=gen.rng, dense_k=dense_k)
+        gen.finalize_road_walls()
+
+        comps = gen.compute_components(buildings)
+        all_conn = len(comps) <= 1
+        return {
+            "roads": n,
+            "doors": len(door_by_bid),
+            "connected": all_conn,
+            "components": [{"root": root, "rooms": members} for root, members in comps.items()],
+            "warnings": [] if all_conn else [f"警告：{len(comps)} 个不连通分量"],
+            "style": style,
+            "density": density,
+        }
+
+    @staticmethod
+    def _room_center_fast(row: Dict[str, Any]) -> Tuple[float, float]:
+        """房间中心：优先 geom_json.center，否则 space 质心。"""
+        try:
+            geom = json.loads(row["geom_json"]) if row.get("geom_json") else {}
+        except Exception:
+            geom = {}
+        if isinstance(geom, dict) and isinstance(geom.get("center"), list) and len(geom["center"]) == 2:
+            return float(geom["center"][0]), float(geom["center"][1])
+        try:
+            tiles = json.loads(row["tiles_json"]) if row.get("tiles_json") else {}
+        except Exception:
+            tiles = {}
+        sp = tiles.get("space") or []
+        if sp:
+            xs = [int(c[0]) for c in sp]
+            ys = [int(c[1]) for c in sp]
+            return sum(xs) / len(xs), sum(ys) / len(ys)
+        return 0.0, 0.0

@@ -65,14 +65,26 @@ class UnionFind:
     def connected(self, x: int, y: int) -> bool:
         return self.find(x) == self.find(y)
 
+    def components(self) -> Dict[int, List[int]]:
+        """连通分量：root -> 成员列表（按 id 升序）。"""
+        comps: Dict[int, List[int]] = defaultdict(list)
+        for x in self.parent:
+            comps[self.find(x)].append(x)
+        for members in comps.values():
+            members.sort()
+        return dict(comps)
+
 
 class RoadGenerator:
     ROAD_WIDTH = 5
     MAX_TURNS = 2
     DOOR_MARGIN = 2          # 门洞两端各留的墙格数（不在拐角开门）
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(self, db_manager: Optional[DatabaseManager] = None, max_turns: int = 6):
         self.db = db_manager or DatabaseManager()
+        # A* 兜底路径允许的最大折角数（默认 6 保持原行为；密集塞房场景可调大）
+        # 也可通过 generate_and_save_roads(max_turns=...) 按次覆盖
+        self._max_turns = max(1, int(max_turns))
 
     # ==================================================================
     # helpers
@@ -391,6 +403,7 @@ class RoadGenerator:
         room_spaces: Dict[int, Set[Cell]],
         road_cells: Dict[int, Set[Cell]],
         rng: random.Random,
+        astar_max_steps: int = 80000,
     ) -> Optional[Tuple[List[Cell], Set[Cell]]]:
         """
         候选路径中找第一条**不进入任何房间 space** 的（墙不是障碍：
@@ -406,11 +419,11 @@ class RoadGenerator:
             if self._band_free_of_rooms(band, openings, room_spaces):
                 return path, band
 
-        # 兜底：A* 避让（折角 ≤ 6）
-        astar = self._astar_avoidance(start_cell, end_cell, room_spaces)
+        # 兜底：A* 避让（折角 ≤ _max_turns；大地图长路可调大 astar_max_steps）
+        astar = self._astar_avoidance(start_cell, end_cell, room_spaces, max_steps=astar_max_steps)
         if astar:
             pts, turns = self._simplify_and_turns(astar)
-            if turns <= 6:
+            if turns <= self._max_turns:
                 band = self._band_for_path(pts)
                 if self._band_free_of_rooms(band, openings, room_spaces):
                     return pts, band
@@ -751,16 +764,33 @@ class RoadGenerator:
         dense_room_ids: Optional[List[int]] = None,
         dense_groups: Optional[List[List[int]]] = None,
         dense_degree: int = 2,
+        max_turns: int = 6,
+        only_room_ids: Optional[List[int]] = None,
+        astar_max_steps: int = 80000,
     ) -> JsonDict:
         """
         节点图式路网生成（分层）：
         - 阶段 0（稠密）：dense_room_ids 内的房间互相多连（每房间连 dense_degree 个最近），
           用于大建筑区内部稠密路网（每个建筑不止与一个相连）。
+        - 阶段 0b（冗余稠密）：全部连通后仍为每房间补连 dense_degree 个最近同组房间
+          （含同分量），形成真正的"稠密"多连而非 MST 骨架。
         - 阶段 1（稀疏）：全区最近的不同分量节点（MST 式 + 道路互联），
           所有建筑区互相连接，形成"配对 + 道路互联 + 分支"的网状而非链式。
-        - 生成后清理孤立外墙门。
+        - 阶段 2（子群互联）：稀疏后仍有多个分量时，用最近的一对不同分量的道路连接子群。
+
+        形态（折角上限）：
+        - 优先更直：候选按 _generate_paths 生成顺序（直线 → L 形1折 → Z/C 形2折）依次尝试；
+        - 0/1/2 折全失败后用 A* 避让路径兜底，压缩后折角 ≤ max_turns（默认 6）。
+
+        only_room_ids：限定参与连接的房间（如"只连某大建筑区内房间"或"区际只连各代表门"）；
+        其余房间作为障碍参与避让、但不会被连接。None = 全区连接（默认）。
+        astar_max_steps：A* 兜底展开上限（默认 8 万；1200x1200 大地图区际长路需调大，如 150 万）。
+
+        返回统计 dict（roads / doors / connected / components / warnings 等）。
         """
         self.ROAD_WIDTH = max(1, int(width))
+        self._max_turns = max(1, int(max_turns))
+        self._astar_max_steps = max(1000, int(astar_max_steps))
         rng = random.Random(seed if seed is not None else random.randrange(0, 2 ** 31 - 1))
 
         rooms = self._fetch_rooms(map_id, layer)
@@ -781,6 +811,10 @@ class RoadGenerator:
             if self._has_exterior_wall(r, _pre_obstacles)
         ]
         skipped_rooms = [int(r["id"]) for r in non_road if r not in connectable]
+        if only_room_ids is not None:
+            allowed = set(int(x) for x in only_room_ids)
+            connectable = [r for r in connectable if int(r["id"]) in allowed]
+            skipped_rooms = [int(r["id"]) for r in non_road if int(r["id"]) not in allowed]
         if len(connectable) < 2:
             return {"roads": 0, "doors": 0, "connected": True, "skipped_rooms": skipped_rooms,
                     "components": [], "warnings": ["可连接房间数不足 2"]}
@@ -820,21 +854,20 @@ class RoadGenerator:
         def all_connected() -> bool:
             return len({uf.find(rid) for rid in room_ids}) <= 1
 
-        def pick_target(
+        def pick_targets(
             origin: Tuple[float, float],
             start_root: int,
-        ) -> Optional[Tuple[str, int, Tuple[float, float]]]:
-            """最近的不同分量节点（房间或道路）。"""
-            best = None
-            best_d = float("inf")
+            limit: int = 4,
+        ) -> List[Tuple[str, int, Tuple[float, float]]]:
+            """最近的不同分量节点（房间或道路），返回最多 limit 个候选
+            （最近的连不通时依次尝试更远的，保证稀疏阶段也能全连通）。"""
+            cands: List[Tuple[float, Tuple[str, int, Tuple[float, float]]]] = []
             for rid in room_ids:
                 if uf.find(rid) == start_root:
                     continue
                 c = self._room_center(next(r for r in non_road if int(r["id"]) == rid))
                 d = abs(c[0] - origin[0]) + abs(c[1] - origin[1])
-                if d < best_d:
-                    best_d = d
-                    best = ("room", rid, c)
+                cands.append((d, ("room", rid, c)))
             for rm in roads_mem:
                 if uf.find(rm["id"]) == start_root:
                     continue
@@ -842,10 +875,9 @@ class RoadGenerator:
                 if pt is None:
                     continue
                 d = abs(pt[0] - origin[0]) + abs(pt[1] - origin[1])
-                if d < best_d:
-                    best_d = d
-                    best = ("road", rm["id"], (pt[0] + 0.5, pt[1] + 0.5))
-            return best
+                cands.append((d, ("road", rm["id"], (pt[0] + 0.5, pt[1] + 0.5))))
+            cands.sort(key=lambda t: t[0])
+            return [c for _, c in cands[:limit]]
 
         def endpoint_for(
             kind: str,
@@ -936,7 +968,8 @@ class RoadGenerator:
             nonlocal road_count, door_count, road_name_idx, progressed
             openings = s_ep["openings"] | t_ep["openings"]
             res_path = self._find_valid_path(s_ep["cell"], t_ep["cell"], openings,
-                                             room_interiors, {}, rng)
+                                             room_interiors, {}, rng,
+                                             astar_max_steps=self._astar_max_steps)
             if res_path is None:
                 return None
             path, band = res_path
@@ -1080,7 +1113,8 @@ class RoadGenerator:
         dup_count: Dict[Any, int] = {}        # (起点,终点) -> 重复截断计数
         stopped_starts: Set[int] = set()      # 停止尝试的房间
 
-        def dense_connect(rid: int, t_kind: str, t_id: int, t_pos: Tuple[float, float]):
+        def dense_connect(rid: int, t_kind: str, t_id: int, t_pos: Tuple[float, float],
+                          check_redundant: bool = True):
             """稠密连接（复用门口）：起点房间用缓存门洞，目标房间也缓存。
             返回 connect_with_eps 的 (status, key) 或 None。"""
             nonlocal road_count, door_count, road_name_idx, progressed
@@ -1102,8 +1136,9 @@ class RoadGenerator:
                 t_ep = endpoint_for("road", t_id, (s_ep["cell"][0] + 0.5, s_ep["cell"][1] + 0.5))
                 if t_ep is None:
                     return None
-            # 稠密：交叉截断时接入的道路若已与起点连通则放弃（避免 b1 自己连自己）
-            return connect_with_eps(s_ep, t_ep, check_redundant=True)
+            # 稠密：交叉截断时接入的道路若已与起点连通则放弃（避免 b1 自己连自己）；
+            # 冗余稠密阶段 check_redundant=False：允许接入已有道路形成 T 型支路。
+            return connect_with_eps(s_ep, t_ep, check_redundant=check_redundant)
 
         for _round in range(len(dense_ids) + 2):
             if all_connected():
@@ -1165,6 +1200,41 @@ class RoadGenerator:
             if not progressed:
                 break
 
+        # ---- 阶段 0b：冗余稠密（文档语义"每房间连 dense_degree 个最近"） ----
+        # 跨分量阶段在全部连通后即停，只能形成接近 MST 的骨架；冗余阶段在全部连通后
+        # 仍为每房间补连 dense_degree 个最近同组房间（含同分量），形成真正的"稠密"多连。
+        if dense_groups and dense_degree >= 2:
+            for rid in sorted(dense_ids - stopped_starts):
+                group = next((g for g in dense_groups if rid in g), [])
+                if not group:
+                    continue
+                r = next(x for x in non_road if int(x["id"]) == rid)
+                origin = self._room_center(r)
+                cands = sorted(
+                    (d for d in group if d != rid),
+                    key=lambda d: abs(self._room_center(
+                        next(x for x in non_road if int(x["id"]) == d))[0] - origin[0])
+                    + abs(self._room_center(next(x for x in non_road if int(x["id"]) == d))[1] - origin[1]),
+                )
+                successes = 0
+                attempts = 0
+                for t_rid in cands:
+                    if successes >= dense_degree or attempts >= DENSE_FANOUT * 3:
+                        break
+                    tc = self._room_center(next(x for x in non_road if int(x["id"]) == t_rid))
+                    res = dense_connect(rid, "room", t_rid, tc, check_redundant=False)
+                    attempts += 1
+                    if res is None:
+                        continue
+                    status, key = res
+                    if status == "ok":
+                        successes += 1
+                        progressed = True
+                    else:
+                        dup_count[key] = dup_count.get(key, 0) + 1
+                        if dup_count[key] >= DUP_STOP_THRESHOLD:
+                            break
+
         # ---- 阶段 1：稀疏路网（全区：最近的不同分量节点，MST 式 + 道路互联） ----
         for _round in range(len(room_ids) * 3 + 2):
             if all_connected():
@@ -1190,13 +1260,10 @@ class RoadGenerator:
                               sum(y for _, y in rm["space"]) / len(rm["space"]) + 0.5)
                     start_root = uf.find(nid)
 
-                target = pick_target(origin, start_root)
-                if target is None:
-                    continue
-                t_kind, t_id, t_pos = target
-
-                if connect_once(kind, nid, t_kind, t_id, t_pos):
-                    break
+                targets = pick_targets(origin, start_root, limit=4)
+                for t_kind, t_id, t_pos in targets:
+                    if connect_once(kind, nid, t_kind, t_id, t_pos):
+                        break
 
             if not progressed:
                 break
@@ -1262,6 +1329,229 @@ class RoadGenerator:
             "orphan_doors_removed": removed_doors,
             "outer_walls_repaired": repaired_walls,
             "skipped_rooms": skipped_rooms,
+            "connected": all_conn,
+            "components": [{"root": root, "rooms": members} for root, members in comps.items()],
+            "warnings": [] if all_conn else [f"警告：{len(comps)} 个不连通分量"],
+        }
+
+    # ==================================================================
+    # 区内主路识别（供区际连接作为起点）
+    # ==================================================================
+    def find_main_roads(
+        self,
+        map_id: int,
+        layer: int = 1,
+        area_ids: Optional[List[int]] = None,
+    ) -> Dict[int, int]:
+        """
+        每个建筑区找一条**区内主路**：把区内路网按树理解（叶子 = 房屋，父节点 = 路），
+        主路 = **被最多其它路作为端点引用**的路（度最大的路，即树中分支汇聚最多的"最根节点"）。
+
+        返回 {area_id: road_id}；没有区内道路的建筑区不返回。
+        供 `generate_inter_area_roads` 作为区际连接起点（上级路用下级路的主路接出）。
+        """
+        rooms = self._fetch_rooms(map_id, layer)
+        non_road = [r for r in rooms if (r.get("room_type") or "") != "road"]
+        roads = [r for r in rooms if (r.get("room_type") or "") == "road"]
+        area_of_room: Dict[int, Optional[int]] = {}
+        for r in non_road:
+            area_of_room[int(r["id"])] = r.get("building_area_id")
+
+        want = set(int(a) for a in (area_ids or [])) if area_ids is not None else None
+
+        # 每条路 connects 端点 id 集合 + 每条路所属建筑区（按端点房间归属）
+        connects_of: Dict[int, Set[int]] = {}
+        road_by_area: Dict[int, List[int]] = defaultdict(list)
+        for rd in roads:
+            rid = int(rd["id"])
+            o = self._loads(rd.get("other_json"), {})
+            eps: Set[int] = set()
+            for c in o.get("connects", []):
+                if isinstance(c, dict) and "id" in c:
+                    eps.add(int(c["id"]))
+            connects_of[rid] = eps
+            for eid in eps:
+                a = area_of_room.get(eid)
+                if a is not None:
+                    road_by_area[int(a)].append(rid)
+                    break
+
+        # 被引用计数：road X 被多少条其它路的 connects 作为端点引用
+        ref_count: Dict[int, int] = defaultdict(int)
+        for rid, eps in connects_of.items():
+            for e in eps:
+                if e in connects_of:
+                    ref_count[e] += 1
+
+        main: Dict[int, int] = {}
+        for area_id, road_ids in road_by_area.items():
+            if want is not None and area_id not in want:
+                continue
+            best = None
+            best_deg = -1
+            for rid in road_ids:
+                deg = ref_count.get(rid, 0)
+                if deg > best_deg or (deg == best_deg and best is not None and rid < best):
+                    best_deg = deg
+                    best = rid
+            if best is not None:
+                main[area_id] = best
+        return main
+
+    def _road_center_cell(self, road: JsonDict) -> Optional[Cell]:
+        """道路 space 中心格（离质心最近的 space 格）。"""
+        t = self._loads(road.get("tiles_json"), {})
+        sp = [(int(c[0]), int(c[1])) for c in (t.get("space") or [])
+              if isinstance(c, (list, tuple)) and len(c) == 2]
+        if not sp:
+            return None
+        mx = sum(x for x, _ in sp) / len(sp)
+        my = sum(y for _, y in sp) / len(sp)
+        return min(sp, key=lambda c: (c[0] - mx) ** 2 + (c[1] - my) ** 2)
+
+    # ==================================================================
+    # 区际折角连接（把多个分区用折角中型道路连成整体）
+    # ==================================================================
+    def generate_inter_area_roads(
+        self,
+        map_id: int,
+        layer: int = 1,
+        main_roads: Optional[List[int]] = None,
+        width: int = 10,
+        seed: Optional[int] = None,
+        max_turns: int = 40,
+        astar_max_steps: int = 1500000,
+    ) -> JsonDict:
+        """
+        区际折角连接：**从每区主路接出**（上级路用下级路的主路作为起点）。
+
+        main_roads：每区主路 road id 列表（先调 `find_main_roads` 得到 {area_id: road_id}，
+        取 values）；None 时按"区际只连 road 节点"的最小集退化为空（需显式传入）。
+        用**折角路径**（优先更直：直线 → L 形1折 → Z/C 形2折 → A* 避让兜底，
+        折角 ≤ max_turns，展开 ≤ astar_max_steps）把各区主路连成整体。
+
+        与 generate_and_save_roads（区内）的区别：
+        - 区内要求**整个带宽避开房间**（road 不与房间重叠）；
+        - 区际长路穿越建筑群时带必然贴建筑走，因此只要求**路径中心线避开房间内部格**，
+          保存时把建筑格从带中剪掉（`_build_road_tiles`：road_space = 带 − 所有房间格），
+          墙也剔除建筑格、交叉处打通——与 RoadStyleGenerator.connect_inter_area 同语义。
+
+        端点 = 主路 space 中心格（不开新门）；connects 记录 ("road", 主路id) ↔ ("road", 主路id)。
+
+        返回统计 dict（roads / doors / connected / components / warnings）。
+        """
+        self.ROAD_WIDTH = max(1, int(width))
+        self._max_turns = max(1, int(max_turns))
+        rng = random.Random(seed if seed is not None else random.randrange(0, 2 ** 31 - 1))
+
+        rooms = self._fetch_rooms(map_id, layer)
+        non_road = [r for r in rooms if (r.get("room_type") or "") != "road"]
+        allowed = set(int(x) for x in (main_roads or []))
+        gates = [r for r in rooms if (r.get("room_type") or "") == "road" and int(r["id"]) in allowed]
+        if len(gates) < 2:
+            return {"roads": 0, "doors": 0, "connected": True, "components": [],
+                    "warnings": ["区际连接需要 ≥2 个主路（先调 find_main_roads）"]}
+
+        # 预计算：内部格 = 路径障碍；所有房间格 = 保存时剪掉
+        room_interiors: Dict[int, Set[Cell]] = {}
+        room_spaces: Dict[int, Set[Cell]] = {}
+        all_room_cells: Set[Cell] = set()
+        for r in non_road:
+            t = self._loads(r.get("tiles_json"), {})
+            rid = int(r["id"])
+            spaces = self._tile_cells(t, ("space",))
+            walls = self._tile_cells(t, ("wall",))
+            room_interiors[rid] = spaces - walls
+            room_spaces[rid] = spaces
+            all_room_cells |= self._tile_cells(t, ("wall", "space", "inner_wall"))
+
+        uf = UnionFind()
+        gate_pts: Dict[int, Cell] = {}
+        for g in gates:
+            rid = int(g["id"])
+            uf.make_set(rid)
+            pt = self._road_center_cell(g)
+            if pt is not None:
+                gate_pts[rid] = pt
+
+        def _path_between(s: Cell, e: Cell) -> Optional[List[Cell]]:
+            # 候选：优先更直（直线 → L → Z/C），中心线带检查
+            for path in self._generate_paths(s, e):
+                band = self._band_for_path(path)
+                if self._band_free_of_rooms(band, set(), room_interiors):
+                    return path
+            # A* 兜底：中心线避障（折角 ≤ max_turns）
+            astar = self._astar_avoidance(s, e, room_interiors, max_steps=astar_max_steps)
+            if astar:
+                pts, turns = self._simplify_and_turns(astar)
+                if turns <= self._max_turns:
+                    return pts
+            return None
+
+        roads_mem: List[Dict[str, Any]] = []
+        road_count = 0
+        door_count = 0
+        road_name_idx = 0
+        failed_pairs: Set[Tuple[int, int]] = set()
+        gate_ids = [int(g["id"]) for g in gates]
+
+        while True:
+            # 最近的不同分量主路对（MST 式）
+            best = None
+            best_d = float("inf")
+            for i in range(len(gate_ids)):
+                gi = gate_ids[i]
+                pi = gate_pts.get(gi)
+                if pi is None:
+                    continue
+                for j in range(i + 1, len(gate_ids)):
+                    gj = gate_ids[j]
+                    pj = gate_pts.get(gj)
+                    if pj is None or uf.find(gi) == uf.find(gj):
+                        continue
+                    key = (gi, gj) if gi < gj else (gj, gi)
+                    if key in failed_pairs:
+                        continue
+                    d = abs(pi[0] - pj[0]) + abs(pi[1] - pj[1])
+                    if d < best_d:
+                        best_d = d
+                        best = (gi, gj)
+            if best is None:
+                break
+            a, b = best
+            path = _path_between(gate_pts[a], gate_pts[b])
+            if path is None:
+                failed_pairs.add((a, b) if a < b else (b, a))
+                continue
+
+            band = self._band_for_path(path)
+            self._clear_crossing_walls(map_id, layer, band)
+            other_spaces: Set[Cell] = set()
+            for rm in roads_mem:
+                other_spaces |= rm["space"]
+            road_space, road_wall = self._build_road_tiles(band, room_spaces, all_room_cells, other_spaces)
+            connects = [
+                {"kind": "road", "id": a},
+                {"kind": "road", "id": b},
+            ]
+            road_name_idx += 1
+            road_id = self._save_road(map_id, layer, f"InterRoad_{road_name_idx}", band,
+                                      road_space, road_wall, connects, path)
+            if road_id is None:
+                break
+            uf.make_set(road_id)
+            uf.union(a, road_id)
+            uf.union(b, road_id)
+            roads_mem.append({"id": road_id, "space": road_space, "connects": connects})
+            road_count += 1
+
+        comps = defaultdict(list)
+        for g in gate_ids:
+            comps[uf.find(g)].append(g)
+        all_conn = len(comps) <= 1
+        return {
+            "roads": road_count,
+            "doors": door_count,
             "connected": all_conn,
             "components": [{"root": root, "rooms": members} for root, members in comps.items()],
             "warnings": [] if all_conn else [f"警告：{len(comps)} 个不连通分量"],

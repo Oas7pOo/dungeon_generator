@@ -53,13 +53,29 @@ class InteriorSpec:
 @dataclass(frozen=True)
 class ConnectionSpec:
     """
-    建筑之间"用哪种方式连接"（道路路网，规划中，阶段 2）。
+    建筑之间"用哪种方式连接"（道路路网，阶段 2 已落地 door_to_door）。
     mode:
       - none          : 不生成道路（孤立/单体建筑地图默认）
-      - door_to_door  : 门-门相连（最近邻/MST/Delaunay）
-      - fungus        : 类真菌寻路（多前沿生长+合并）
-      - trunk_branch  : 主干道+分干道（分级路网）
-    当前执行器遇到非 none 模式会打印"规划中"警告并跳过，架构先行。
+      - door_to_door  : ✅ 已实现（见 readme §2.8/§2.10/§2.11）
+      - fungus        : 类真菌寻路（规划中，暂按 door_to_door 生成）
+      - trunk_branch  : 主干道+分干道（规划中，暂按 door_to_door 生成）
+    kwargs（透传给 src/ 内的生成器，机制内部化；MapGenerator 按是否有 style 分发）：
+
+      无 style -> RoadGenerator v2（折角折线，§2.8）：
+        - width          : 路宽（默认 5）
+        - layer          : 生成层（默认 1）
+        - seed           : 路网种子（None 时受 MapGenerator 全局 seed 约束，可复现）
+        - dense_room_ids : 稠密阶段房间 id 列表（区内多连）
+        - dense_groups   : 按大建筑区分组的稠密房间（区内稠密、区际留给稀疏）
+        - dense_degree   : 稠密阶段每房间连最近 n 个（默认 2）
+        - max_turns      : A* 兜底路径最大折角数（默认 6）
+
+      有 style -> RoadStyleGenerator（直角/弯曲 × 稠密/稀疏）：
+        - style          : "直角"（4 向 A* 右角折线）| "弯曲"（8 向 A* + 圆角曲线）
+        - density        : "稠密"（每建筑连最近 dense_k 个）| "稀疏"（树形 + 连通保证）
+        - width          : 路宽（默认 5）
+        - seed           : 路网种子
+        - dense_k        : 稠密时每建筑连最近 n 个（默认 3）
     """
     mode: str = "none"
     kwargs: Dict[str, Any] = field(default_factory=dict)

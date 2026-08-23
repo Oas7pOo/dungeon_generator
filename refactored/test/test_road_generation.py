@@ -161,7 +161,11 @@ def test_road_generation():
         if room_types[rid] != "road":
             continue
         other = json.loads(r["other_json"]) if r["other_json"] else {}
-        connects = set(other.get("connects", []))
+        # connects 是 {"kind","id"} 的列表（dict 不可哈希）——提取端点 id 做集合
+        connects = set(
+            int(c["id"]) for c in other.get("connects", [])
+            if isinstance(c, dict) and "id" in c
+        )
 
         for other_rid, other_cells in room_cells.items():
             if other_rid == rid:
@@ -245,12 +249,15 @@ def test_road_generation():
         uf.make_set(rid)
 
     # 读取道路连接关系，递归合并
-    # 道路连接图：road_id -> connects list
+    # 道路连接图：road_id -> connects 端点 id 列表（connects 是 {"kind","id"} 的 dict 列表）
     road_conn_map = {}
     for road in road_rows:
         rid = int(road["id"])
         other = json.loads(road["other_json"]) if road["other_json"] else {}
-        road_conn_map[rid] = other.get("connects", [])
+        road_conn_map[rid] = [
+            int(c["id"]) for c in other.get("connects", [])
+            if isinstance(c, dict) and "id" in c
+        ]
 
     # 对每条道路，找到它连接的所有房间（递归展开道路链）
     def find_connected_rooms(road_id, visited=None):

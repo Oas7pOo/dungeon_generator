@@ -40,7 +40,7 @@ MapSpec(
         BuildingAreaSpec(generator="circle",    count=2, kwargs=dict(radius_range=(4,7))),
     ],
     interior=InteriorSpec(mode="basic"),        # ② 区内用哪种方式生成建筑/房屋
-    connection=ConnectionSpec(mode="door_to_door"),  # ③ 用哪种方式连接（道路，规划中）
+    connection=ConnectionSpec(mode="door_to_door"),  # ③ 用哪种方式连接（道路，阶段 2 已实现，见 §2.8）
     decoration=DecorationSpec(kind="stone"),    # ④ 用哪种方式修饰（物体，规划中）
 )
 ```
@@ -66,6 +66,9 @@ dungenMap/
 │   │   │   ├── block_room_generator.py     # Watabou 方块房间（粗格 10x10）
 │   │   │   ├── item_generator.py           # 门/窗/楼梯 物品生成
 │   │   │   ├── passability.py              # 可通行性查询（阶段 0 落地）
+│   │   │   ├── road_generator.py           # 道路生成器 RoadGenerator v2（优先更直折线 + 多候选重连，见 §2.8）
+│   │   │   ├── road_style_generator.py     # 路网风格生成器 RoadStyleGenerator（视觉直走/贝塞尔/大中小路宽，见 §2.10/2.11）
+│   │   │   ├── room_subdivider.py          # 房间分割器 RoomSubdivider（BSP 二分 + 共享单墙内墙 + 内部门）
 │   │   │   ├── map_spec.py                 # 地图配方 MapSpec + 主题预设（阶段 0 落地）
 │   │   │   ├── map_generator.py            # 配方执行器 MapGenerator（阶段 0 落地）
 │   │   │   ├── dwellings_house_generator.py # Dwellings 住宅写入器
@@ -89,6 +92,11 @@ dungenMap/
 ├── venv/                      # Python 虚拟环境
 └── readme.md                  # 本文档
 ```
+
+> **机制内部化原则（重要）**：**大部分生成机制应内部化到 `src/`**（生成器类、算法、落库、
+> 门/墙/连通性处理都在 `src/generators/*.py` 内），**生成脚本（`test/*.py`）只做配置与调用**
+> ——构造参数、调用生成器、做统计核验。新增机制时优先写进 `src/` 再让脚本薄薄地调用，
+> 不要把算法逻辑堆在脚本里（如 `RoadGenerator` §2.8 / `RoadStyleGenerator` §2.10-2.11 均为此模式）。
 
 ---
 
@@ -264,6 +272,39 @@ dungenMap/
 - `PlanDivider.divide(area, specs)` 已实现"把任意 area 切成 rooms + inner_walls"，可作为**有机切割**版本；
 - 1.1（规整）、1.3（竞争生长）、1.4/1.5（结构化排布）与 dwellings 有机划分共存，由标签/参数驱动：`mechanical` → 规整/排布，`organic` → 竞争生长/dwellings。
 
+#### 1.8 真实感房间分割：大小混合 / 走廊+房间 / 大厅+小房间 / 环形走廊（待办）
+> 分割应遵循**比例**，一般房间应**有大有小**（不要清一色均分小块）。以下使建筑分割更符合真实情况的方法，生成时可从其中**随机选取一种或多种组合**。
+- **走廊 + 房间**：一条走廊连通多个房间，且**房间后面还有房间**（纵深布局）；
+- **大厅 + 小房间**：一个大房间（hub）联通多个小房间；
+- **环形走廊**：大建筑内走廊可能形成**环形**，环的两侧分布很多房间；
+- **混合**：建筑很大时，可能**既有走廊又有大房间**；
+- **规模约束**：若只有大房间或只有小房间（单一类型），一般**不超过 5 个房间、最大 7 个**；
+  - **"大房间"指 20x20 格起步**，尺寸无上限；
+- **适用范围**：以上方法**可能只用于非斜体（轴对齐）房间**；斜体房间的斜向分割由
+  `RoomSubdivider.subdivide_rotated_room`（局部坐标系 BSP，子房间/共享墙/门沿旋转方向）独立处理。
+
+#### 1.9 地上建筑：入口门 → 门厅 / 大厅 / 餐厅 / 卧室 / 瞭望塔（树形规划，待办）
+> 大型**地上建筑**（城堡 / 庄园 / 要塞 / 府邸）的内部规划：**从入口门开始**，规划
+> **门厅 → 大厅 → 餐厅 → 私人卧室 → 瞭望塔**等功能房间，**通过树形发生器（tree generator）
+> 规划整栋建筑**，**没有被规划的部分直接丢弃**。
+
+- **树形规划模型**：
+  - **根 = 入口门 + 门厅**（foyer / entrance hall）：全楼枢纽，至少 2 条出边（大厅 / 走廊 / 塔楼）；
+  - **节点 = 一个功能房间**，**边 = 门 / 通道**（父子房间之间开门互通，落库 `role=interior`）；
+  - 从门厅逐层向外生长分支：**大厅**（grand hall，集会/宴会大空间）→ **餐厅**（dining hall）→
+    **私人卧室**（private bedrooms，小房间群）→ **瞭望塔**（watchtower，高层小房间，可叠层）……；
+  - **丢弃未规划部分**：树只覆盖被规划到的房间；建筑区内**未被树覆盖的区域不生成房间/墙**
+    （保留为空地 / 外围，而不是被默认填满）。
+- **功能房间规格**（节点可带属性，尺寸约束复用 §1.8）：
+  - 门厅 / 大厅 / 餐厅：**大空间**（"大房间"指 **20x20 格起步**、尺寸无上限）；
+  - 私人卧室：**小房间群**（单一类型一般**不超过 5 个房间、最大 7 个**）；
+  - 瞭望塔：小体量**高层**房间，可向上叠层（对接多层地图）。
+- **与现有系统的关系**：树形规划作为"把一个 `building_area` 变成多个房间"的又一种方式，
+  与 BSP/网格（1.1）、功能房间分配（1.2）、竞争生长（1.3）、dwellings 有机划分（1.7）并列，
+  由标签/参数驱动选择（如 `castle` / `manor` / `tower` 标签）；
+- **复用**：树节点 → 子房间落库沿用 `RoomSubdivider` 契约（共享单墙内墙 + 内部门）；
+  房间几何可基于 1.1 的局部 BSP 递归或 1.2 的功能带切分生成；落地顺序见 §6 阶段表。
+
 ---
 
 ### 2. 道路生成（Road Generation）
@@ -345,6 +386,34 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 
 #### 2.8 已落地的道路实现经验（v2，重要）
 
+> **三套路网的选择（主程序统一入口 = `ConnectionSpec(mode='door_to_door', kwargs={...})`）**：
+> `MapGenerator` 按 kwargs 里**有没有 `style`** 自动分发到两套生成器（机制都在 `src/generators/`，
+> 配方只做配置）：
+>
+> | 想生成 | kwargs 写法 | 走哪个生成器 |
+> |---|---|---|
+> | **折角折线**（直线→L→Z/C，A* 兜底折角 ≤max_turns） | **不带** `style`：`kwargs=dict(width=5, dense_groups=..., max_turns=6)` | `RoadGenerator` v2（本节的 §2.8） |
+> | **直角路网**（4 向 A* 右角折线） | `kwargs=dict(style="直角", density="稀疏", width=5)` | `RoadStyleGenerator`（§2.10/2.11） |
+> | **弯曲路网**（8 向 A* + 圆角曲线） | `kwargs=dict(style="弯曲", density="稠密", width=5)` | `RoadStyleGenerator`（§2.10/2.11） |
+>
+> 生成脚本（demo）也可绕过配方直接实例化生成器调用；但**主程序按配方生成地图时，三种都
+> 通过 `ConnectionSpec.kwargs` 指定**（见 §3 使用方法示例）。
+
+> **折角入口与选项**：`RoadGenerator.generate_and_save_roads(map_id, layer=1, width=5, seed=None,
+> dense_room_ids=None, dense_groups=None, dense_degree=2, max_turns=6)`。
+> 主程序通过 `ConnectionSpec(mode='door_to_door', kwargs={...})`（不带 style）原样透传
+> （见 `map_spec.py`），生成脚本与 `MapGenerator` 都只做**配置与调用**，机制全部在 `src/generators/road_generator.py`。
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `width` | 5 | 路宽（道路带 = 中心线膨胀 ±width/2） |
+| `layer` | 1 | 生成所在层 |
+| `seed` | None | 路网种子；None 时受 MapGenerator 全局 seed 约束（同配方同 seed 可复现） |
+| `dense_room_ids` | None | 稠密阶段房间 id 列表（区内多连） |
+| `dense_groups` | None | 按大建筑区分组的稠密房间；**区内稠密、区际留给稀疏**（v2.2） |
+| `dense_degree` | 2 | 稠密阶段每房间连最近 n 个（含冗余稠密阶段 0b） |
+| `max_turns` | 6 | **A\* 兜底路径允许的最大折角数**（直线/L/Z/C 折线之外的避让兜底；密集塞房场景可调大） |
+
 - **道路贴墙走（共用外墙）**：路径规划障碍 = **仅房间 space**（墙不是障碍）。
   道路带可以贴着房间外墙走、与房屋共用外墙，只禁止覆盖房间内部 space；
   `road_space = 带 − 所有房间格`（墙格保留在房间，不重复画）。这是密集布局下路网能否连通的**关键**。
@@ -372,6 +441,9 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 - **优先更直（v2.5，用户反馈）**：候选路径按生成顺序（直线 → L 形1折 → Z 形2折）依次尝试，
   **不随机打乱**——此前 `rng.shuffle` 会选出"折两次"的路径即使直线/L 形也能到达。
   实测：96% 道路为 1 折 L 形，仅少量需 2 折避让。
+- **多候选重连（v2.6，用户反馈）**：稀疏阶段 `pick_targets` 返回**最多 4 个最近的不同分量
+  候选**（房间或道路），最近的连不通时**依次尝试更远的**——保证"尝试所有建筑和道路的重新连接"，
+  不再因单一最近目标失败而跳过（稀疏/密集塞房下也全连通）。
 - **兜底外墙模型感知（v2.3）**：`_ensure_outer_walls` 直接判定 space 边界格是否被墙隔开
   （自身是墙 / 外侧邻格是墙 / 门洞入口），缺失才补内边缘墙——
   不依赖易误判的"wall 是否在 space 内"检测，避免双圈墙与漏补。
@@ -417,6 +489,134 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
   - `island`：连通分量数 == 预期，分量间仅通过 bridge/ford 相连；
 - 道路不与建筑区/水体/岩石相交（区内道路除外，且必须被包含；桥/渡口除外）；
 - 道路带宽一致、边界无破洞（wall/space 完整）。
+
+#### 2.9 路网风格分类：现代 / 中世纪城镇 / 中世纪乡村 / 远程城镇间（待办）
+> 路网规划应按**风格**分类，不同风格采用**不同的实现方法**（形态、分级、密度、弯曲程度、
+> 层数都不同），而不是同一套算法套所有场景。
+
+- **现代路网**（分级体系 + 高架）：
+  - **大**：高速公路 / 城市快速路——宽、直、少交叉（互通立交）；
+  - **中**：城市主干道——双向多车道，连接大/小区块；
+  - **小**：支路 / 街区道路——填充街区内部，接驳中/大；
+  - **高架**：**多层道路**（不同 layer 的 road room）——地面道路与高架**立体交叉**，节点用
+    互通立交 / 匝道连接（对接多层地图，§5.4 廊坊同类的叠层语义）；
+  - 实现方法：**逐级规划（先大后小）**——先布干线骨架（大/中），再在区块内细化支路（小）；
+    高架作为独立层级，与地面层在投影上交叉但不占用同一层 space。
+- **中世纪城镇路网**（密集街巷）：
+  - 形态：中心**广场/集市放射** + **环状**街 + 密集**巷弄**，道路窄、曲折自然、街块小；
+  - 实现方法：放射+环状骨架 + 有机弯曲（类真菌生长 / 随机游走，§2.2 fungus）+ 巷弄细化，
+    沿建筑区轮廓生长，窄路（1~2 格宽）。
+- **中世纪乡村路网**（稀疏土路）：
+  - 形态：**稀疏**——一条主干连接村庄/农舍/田地，支路稀少、天然土路弯曲；
+  - 实现方法：**MST 式最少连接**（只保证可达）+ 随机弯曲土路 + 沿田地/河岸走向，
+    宽度 1 格为主。
+- **远程城镇间连接路网**（跨城镇长途）：
+  - 形态：**区域间主干**（商路/驿道）连接各**城镇中心**，沿途过桥/渡口（§2.4），长直线段 + 大弯；
+  - 实现方法：**分层规划**——先做区域级主干（连接各城镇入口），再在每个城镇内部做各自的
+    城镇/乡村路网，主干与城内路网在**城镇入口点**对接（§7.2 建筑区入口点概念）。
+- **落地**：`ConnectionSpec` / `MapSpec` 增加**风格参数**
+  （`style='modern' | 'medieval_town' | 'medieval_village' | 'intercity'`），
+  风格决定 §2.1 形态组合、分级层数与密度；§2.2 算法模式（door_to_door / trunk_branch / fungus）
+  与 §2.3 连通性模式在风格内部可组合选用；验收对照 §2.7。
+
+#### 2.10 视觉直走路网（demo 已落地：`test/generate_vision_road_map.py`）
+> 与 RoadGenerator v2 并列的独立路网 demo：**400x600 地图 + 唯一 400x600 建筑区 + 10 个建筑**，
+> 每个建筑外墙开一个门，用"**出门直走朝建筑群中心 + 视野扩大**"接入路网；
+> 道路为**真贝塞尔矢量曲线**（PS 钢笔工具式），像素路从曲线精确栅格化。
+> 输出：`test/output/vision_road_map/`（`vision_road.db`、`*_多层视图.pdf`、`preview_*.png`）。
+
+- **接入流程**：
+  1. 每个建筑在外墙生成一个门（door item，宽 3，门洞从墙移除）；
+  2. 随机取两个门：**A\*（8 向、octile、小扰动弯曲）**直连，作为首条路；
+  3. 其余门（随机顺序）：**出门直走**——前 2 格沿门口朝外；之后**尽量朝当前建筑群的中心直走**
+     （8 向贪心曼哈顿下降，受阻绕行）；**不走回头路**（visited 集合）；
+     **绕开建筑周围 2 格**（障碍 = 建筑格 + 8 邻外扩 2 圈，道路带距建筑 ≥2）；
+  4. **视野 = 已走步数**（走 2 格即有 2 格视野，越走视野越广）；视野内看到路 → 接入；
+     步数上限仍看不到 → 走兜底层级（见下）。
+- **兜底层级（用户规则）**：主 A\*（扰动 0.15，弯曲）→ 超时/失败 → **更不随机的确定性 A\***
+  （扰动 0、上限 150 万）→ 仍失败 → **BFS 直接计算**（有界、必然找到）。
+  不会因为"找不到"跳过建筑——每栋建筑必然接入主路网（核验：10/10 连通分量 1）。
+- **道路 = 真矢量贝塞尔曲线**：
+  - waypoints → **LOS 简化锚点**（间距 ≤50 格）→ **Catmull-Rom 转分段三次贝塞尔**
+    （锚点+控制柄，柄长钳制 ≤8 格，曲线紧贴路径、局部圆角）；
+  - `geom.curve = {"type":"bezier","segments":[[P,C1,C2,Q],...]}`，`geom.path` 保留锚点折线；
+  - **像素路 = 从矢量曲线精确计算**：贝塞尔按**平直度自适应细分**（de Casteljau，LIFO 先压后半段，
+    否则点序反转栅格化出锯齿宽带）→ 逐段栅格化 + 带宽（曲线矢量化）；
+  - 可视化用 matplotlib `Path + CURVE4` 画**真正的曲线原语**（PDF 内即贝塞尔，非折线）；
+    旧 `curve` 点列表与无 `curve` 数据仍按折线回退绘制。
+- **门口接通（用户修正）**：路矢量端点接到**门洞中心格**；像素带**并入建筑门洞格**、
+  **裁剪建筑内溢出**（门洞格保留）、**墙格剔除建筑内格**——门口正前方不再被外墙挡住，
+  核验 10/10 建筑门洞到路带距离 = 0。
+- **无几何断连子网（用户修正）**：每条路声称的 connects 必须**几何相交**——
+  视野接入的 A\* 汇入失败时**不再静默保留"走不到"的假连接**，走兜底层级到最近可达路格；
+  **目标路格跳过障碍内的格**（并入带的门洞格被建筑包围、A\* 永远到不了）。
+  核验：声称连接但几何相交为 0 的连接数 = 0。
+- **交叉连接处打通**：新路墙格被已有路 space 覆盖 → 移除；已有路墙格被新路带覆盖 → 并入其 space
+  （更新已有道路行）；核验任意两条路互相遮挡墙格 = 0。
+- **8 向 A\* 长路径**：稀疏布局下两门/门到路可能相距 500+ 格，A\* 需展开大半个地图
+  （240k 格）；主 A\* 设访问上限（超时即降级到下一级兜底），确定性 A\* 上限 150 万，BFS 无上限。
+
+#### 2.11 分区大地图与路网选项（demo 已落地：`test/generate_mega_vision_road_map.py`）
+> **1200x1200 大地图 + 6 个 300x400 建筑区**（函数随机排布）+ 每区 10 个建筑
+> （**8 矩形 + 1 圆形 + 1 斜矩形**），区内/区际分层路网。
+> 输出：`test/output/mega_vision_road_map/`。
+>
+> **机制内部化**：全部实现位于核心 `src/generators/road_style_generator.py`
+> （`RoadStyleGenerator`：建筑区排布 / 建筑放置 / 任意形状开门 / 寻路（4·8 向 A* + 兜底 + BFS）/
+> 视觉直走 / 圆角曲线 / 道路保存（门口接通·裁剪·交叉打通·大中小路宽）/ 区内·区际连接策略）；
+> demo 脚本只做**配置与调用**。
+
+**用户可选的路网选项（大中小 × 直角/弯曲 × 稠密/稀疏）：**
+
+| 维度 | 选项 | 说明 | 本 demo 用法 |
+|---|---|---|---|
+| **路网大小** | **大路 / 中路 / 小路** | 分级路网概念：小路=区内支路（宽 5），中路=区际干路（宽 10），大路=跨城镇主干（规划，更宽） | 区内=小路（宽 5），区际=**中路**（宽 10） |
+| **路网风格** | **直角 / 弯曲** | 直角=4 向 A\* 右角折线路（横平竖直）；弯曲=8 向 A\* + 视觉直走 + **圆角曲线**（转角圆弧、**无过冲突起**） | 2 区直角、2 区弯曲 |
+| **路网密度** | **稠密 / 稀疏** | 稠密=每建筑连最近 3 个（网）+ 连通保证；稀疏=树（每建筑连最近已连通） | 2 区稠密、2 区稀疏 |
+| **建筑区排布** | **函数随机排布** | `place_areas`：地图分 2x3 网格单元 + 单元内随机抖动 + 区号随机分配（保证区距、必然放得下） | 6 区 |
+| **建筑类型** | **矩形 / 圆形 / 斜矩形** | 圆形=半径栅格化；斜矩形=旋转角栅格化（斜边门用**8 邻外向**检测，门外一点不会算进建筑里） | 每区 8+1+1 |
+| **区际连接** | **折角中路 / 孤立** | 每区先找**区内主路**（度最大的路 = 树中最根节点），区际**从主路中心接出**（`find_main_roads` + `generate_inter_area_roads`），折角路径（直线→L→Z/C→A* 兜底，折角≤max_turns）；可留若干区孤立 | 6 区全部连接（折角中路，宽 10） |
+
+> **路级别不硬编码（v2.7，用户要求）**：大/中/小路只是**宽度参数**（默认
+> `ROAD_SMALL_W=5 / ROAD_MED_W=10 / ROAD_LARGE_W=15`，可换任意值），生成方式（折角/直角/弯曲 ×
+> 稀疏/稠密）同样每次指定——`connect_area` / `connect_inter_area` 的 `style`/`density`/`width`
+> 全是参数，`connect_inter_area` 不再写死"弯曲"（默认仍弯曲，可传 `style="直角"` 等）。
+
+> **区内主路识别（v2.7，用户要求）**：`RoadGenerator.find_main_roads(map_id, layer)` 把每个建筑区的
+> 区内路网按树理解（叶子 = 房屋，父节点 = 路），主路 = **被最多其它路作为端点引用的路**
+> （度最大的路 ≈ 树的最根节点）；区际连接 `generate_inter_area_roads(main_roads=...)`
+> 从主路 space 中心接出（上级路用下级路的主路作为起点），而非"选离区中心最近的建筑门"。
+
+> **门外点必须避开障碍（v2.7 修复）**：`make_door` 的 `blocked` 此前**只存签名没用**，斜矩形/圆形
+> 斜边墙的门外点（`door_exterior` 取门外 `width//2+1` 格）可能落进**别的建筑或外扩圈** →
+> A* 起点在障碍里、该建筑所有连接失败（mega 六风格地图实测 B4_10 斜矩形孤立）。修复：
+> 选门洞时用 `dmid` + `out_dir` 计算门外点并检查不在 `blocked`（传 `gen.obstacles` = 建筑格+外扩圈，
+> 而非 building_cells）。核验：60/60 建筑全连通。
+
+> **区内多分量补连不放弃（v2.7 修复）**：`_ensure_area_connected` 此前最近跨分量对路径失败即
+> `break`，该分量永远连不上（斜矩形孤立根因之一）——改为**跳过失败对、依次尝试次近跨分量对**。
+
+> **直角/弯曲经主程序指定（`ConnectionSpec.kwargs` 带 `style` 即可，见 §2.8 顶部选择表）**：
+>
+> ```python
+> connection=ConnectionSpec(mode="door_to_door", kwargs=dict(
+>     style="直角",            # "直角"（4 向 A* 右角折线）| "弯曲"（8 向 A* + 圆角曲线）
+>     density="稀疏",          # "稀疏"（树形，每建筑连最近已连通 + 连通保证）
+>                              # "稠密"（每建筑连最近 dense_k 个 + 补连）
+>     width=5, seed=7, dense_k=3,   # 稠密强度：dense_k 默认 3
+> ))
+> ```
+> 不写 `style` 就是**折角折线**（`RoadGenerator` v2，选项见 §2.8 表格：`dense_groups`/`dense_degree`/`max_turns`）。
+> 三种方式共享同一 `ConnectionSpec` 入口，`MapGenerator` 自动分发；稠密/稀疏在**直角/弯曲**里是
+> `density` 参数（区内二选一），在**折角**里是分层阶段（稠密= `dense_groups` 分组多连，
+> 稀疏= 全区 MST 恒跑，见 §2.8）。
+
+- **实现要点（用户修正记录）**：
+  - **门外一点必须避开建筑**：旋转矩形/圆形等斜边墙的外向是**对角**方向，用 4 邻检测会把门外一点算进建筑内
+    （A\* 终点在障碍里 → 连接失败）——改为 **8 邻外向 + 径向匹配**；
+  - **转角无突起**：弯曲路用**圆角**（直线段 + 转角圆弧，控制点=角点，无 Catmull-Rom 过冲/钩子），
+    直角路保持右角折线（退化贝塞尔段）——消除"先左转再左转"和"汇入侧路突起"；
+  - 门洞格并入路带（门口接通）、墙格剔除建筑内格、交叉连接处打通——同 §2.10。
 
 ---
 
@@ -526,8 +726,8 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 | 阶段 | 内容 | 依赖 |
 |---|---|---|
 | **阶段 0（前置重构）** | ✅ **已完成**：RNG 种子化（MapGenerator 层全局 seed，零侵入）；迁移机制（migrations.py + v001）；MapSpec 配方架构 + MapGenerator 执行器；PassabilityIndex 可通行性基础；建筑区入口点（待补）；坐标约定文档化；room_type/other_json 契约（文档） | 无 |
-| **阶段 1** | 房间分割与生成扩展：BSP/网格 → 膨胀接触分割（1.3）→ 排屋（1.4）→ 对称神殿（1.5）→ 破碎侵蚀（1.6） | 阶段 0 |
-| **阶段 2** | 道路生成：door_to_door → trunk_branch → fungus；连通性模式（full/mostly/island/孤立）；road room 落库 + 避障 | 阶段 0/1（门端点） |
+| **阶段 1** | 房间分割与生成扩展：BSP/网格 → 膨胀接触分割（1.3）→ 排屋（1.4）→ 对称神殿（1.5）→ 破碎侵蚀（1.6）→ 真实感分割 1.8（走廊+房间 / 大厅+小房间 / 环形走廊）→ 地上建筑树形规划 1.9（门厅/大厅/餐厅/卧室/瞭望塔） | 阶段 0 |
+| **阶段 2** | 道路生成：door_to_door ✅（RoadGenerator v2：优先更直折线 + 多候选重连 + 稠密/稀疏分层，§2.8）→ trunk_branch → fungus（规划中）；连通性模式（full/mostly/island/孤立）；road room 落库 + 避障 → 路网风格分类 2.9（现代大中小高架 / 中世纪城镇 / 中世纪乡村 / 远程城镇间）→ 视觉直走路网 demo 2.10（已落地：出门直走朝中心 + 视野接入 + 贝塞尔曲线矢量 + 兜底层级）→ 分区大地图 demo 2.11（已落地：大中小×直角/弯曲×稠密/稀疏） | 阶段 0/1（门端点） |
 | **阶段 3** | 洞穴生成：道路侵蚀 → 矩形溶蚀 → 不规则 | 阶段 0 |
 | **阶段 4** | 物体系统：water/stone item、可通行性避障集成、可视化配色 | 阶段 0 |
 | **阶段 5** | 水系统整合：河流/湖泊/瀑布、水穿建筑、桥/渡口（依赖 §4 水体）、多层廊坊 | 阶段 2/4 |
@@ -546,6 +746,8 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 | `generators/building_area_generator.py` | STRtree 避障、最大空闲区、多层放置、旋转矩形 | `_largest_free_polygon_for_layer` 可充当道路"可走区域"；`_area_row_to_geom` 重建 area 几何 | **无"建筑区入口/门口点"概念**；无"组合建筑区"（神殿）与"跨水建筑"（廊坊）模式 |
 | `generators/room_generator.py` | 每 area 一个房间（圆/多边形），迷宫内墙 | tiles 结构即道路/洞穴/破墙载体；`_tiles_for_polygon` 栅格化可复用 | 使用**全局 random**（不可复现）；room_type 无 road/cave；分割/侵蚀/避水逻辑未接入 |
 | `generators/block_room_generator.py` | Watabou 粗格（scale=10）走廊+房间+门；door gap 挖洞；孔合并；轮廓提取 | **corridor 分支 walker 是"类真菌寻路"原型**；`_grow_room` 是"膨胀接触分割"的单房间原型；`_find_doors` + gap carve 可复用于道路/分割的门；`_cells_to_outer_loop` 轮廓提取 | 粗格尺度固定 10；corridor 未作为独立 road room 落库；门为粗格 key，无跨建筑区语义 |
+| `generators/road_generator.py` | RoadGenerator v2（§2.8）：优先更直折线（直线/L/Z/C）+ A* 兜底（折角≤max_turns）+ 稠密/冗余稠密/稀疏/子群互联四阶段 + 多候选重连 + 门口复用 + 兜底外墙 + 道路矢量折线落库；`find_main_roads` 区内主路识别 + `generate_inter_area_roads` 区际折角连接（主路接出） | 节点图式路网（房间+道路统一并查集）；`ConnectionSpec.kwargs` 透传选项；`MapGenerator._generate_roads` 只做配置与调用 | 连通性模式 mostly/island/孤立未实现；避障只对房间内部格（water/stone 待接 §4.4） |
+| `generators/road_style_generator.py` | RoadStyleGenerator（§2.10/2.11）：建筑区排布/建筑放置/任意形状开门（门外点避障）/4·8 向 A* + 兜底 + BFS/视觉直走/圆角曲线/道路保存/区内·区际连接策略（style 参数化不硬编码） | 直角/弯曲路网的机制本体：demo 脚本直调，或主程序经 `ConnectionSpec.kwargs` 带 `style` 分发（§2.8 选择表） | 区际连接策略仅 demo 直调使用；`style`/`density`/`width` 每次传入（路级别不硬编码） |
 | `generators/dwellings_core/` | Dwellings.js 迁移：RNG / plan.py（divideArea、mergeCorridors）/ house.py（connectRooms、wallDoors）/ shape.py（Edge、Dir、outline_edges、contour2area）/ specs / tags | **`PlanDivider.divide` = 有机房间分割**；`connect_rooms_js` = 门连接；shape 几何基元库 = 道路/洞穴/破碎的底层工具；`RNG` = 可复现随机 | 局部粗格坐标 + origin 偏移，与细格世界坐标并存，道路/水体生成需统一换算（工具已部分存在） |
 | `generators/dwellings_house_generator.py` | dwellings 输出写 room + door/window/stairs item；edge_key → 世界坐标 | **door item 的 position/edge_key 是道路端点的自然来源**；`_edge_center_world` 坐标换算 | 每个 building_area 独立生成，无跨建筑区概念 |
 | `generators/item_generator.py` | 每房间随机门 + 外墙窗 + 楼梯分组；全局 space 索引 | `save_item` 可直接复用于 water/stone（item_type 扩展）；外墙判定思路可复用于道路边缘检测 | `generate_door_for_room` 是**随机门**（无 edge_key），不能作为道路的确定性端点输入；无 water/stone 生成逻辑 |
@@ -575,7 +777,7 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 | RNG 种子化 | ✅（零侵入） | `MapGenerator` 入口 `random.seed` + `np.random.seed`；dwellings 用自身 RNG 派生种子；同配方同 seed 复现已测试 |
 | 兼容性修复 | ✅ | `item_generator.py`：`building_area_id=None` 的房间（Watabou 全图模式）生成门/窗不再崩溃 |
 | 房间分割器 | ✅ | `RoomSubdivider`：BSP 二分 + 共享单墙内墙 + 内部门（mega 地图：最大建筑分割 5 房、7 内部门） |
-| 道路稠密/稀疏分层 | ✅ | `RoadGenerator`：稠密（避免冗余 + 门口复用）+ 稀疏（MST）+ 兜底外墙 + 道路矢量折线（§2.8） |
+| 道路稠密/稀疏分层 | ✅ | `RoadGenerator`：稠密（避免冗余 + 门口复用）+ 冗余稠密（dense_degree）+ 稀疏（多候选重连）+ 子群互联 + 兜底外墙 + 道路矢量折线（§2.8）；选项经 `ConnectionSpec.kwargs` 透传 |
 | 测试 | ✅ | `test/test_map_spec.py` 6 项 + `test/test_road_generator.py` 3 项全过；既有测试无回归 |
 
 **阶段 0 剩余待办**：建筑区入口点（entrance）概念、坐标统一工具抽取、道路避障几何工具整理（见 §7.2-4/6/7）。
@@ -640,9 +842,16 @@ vis.save_map(fig, "测试地图_层1", formats=["png", "pdf"])
 cd refactored
 python -m pytest test -v          # 运行 test/ 下全部测试
 python test/test_combined.py      # 组合测试（房间与门 + 建筑区压力）
+python test/test_road_generator.py      # RoadGenerator v2 单元测试（连通/门/孤立门清理，见 §2.8）
+python test/test_road_generation.py     # 道路生成端到端脚本（6 房间 + 道路连通核验）
+python test/generate_rect_fill_map.py      # 矩形房间填充地图（旋转矩形先放 + 稀疏/稠密路网，见 §1.8/2.9）
+python test/generate_vision_road_map.py    # 视觉直走路网 demo（贝塞尔曲线路，见 §2.10）
+python test/generate_mega_vision_road_map.py  # 1200x1200 分区大地图（大中小×直角/弯曲×稠密/稀疏，见 §2.11）
+python test/generate_mega_six_style_map.py    # 1200x1200 六风格测验：6 区×（折角/直角/弯曲 × 稀疏/稠密）+ 区际折角主路连接
 ```
 
-测试输出目录：`refactored/test/output/`（含 `room_and_door`、`building_area_stress`、`block_room_test` 等子目录）。
+测试输出目录：`refactored/test/output/`（含 `room_and_door`、`building_area_stress`、`block_room_test`、
+`rect_fill_map`、`vision_road_map` 等子目录）。
 
 ### 3. 按配方生成地图（MapSpec，阶段 0 新增）
 
@@ -660,9 +869,25 @@ spec = MapSpec(
         BuildingAreaSpec(generator="circle", count=2, kwargs=dict(radius_range=(4, 7))),
     ],
     interior=InteriorSpec(mode="maze"),
+    # ---- 三种道路任选其一（MapGenerator 按 kwargs 有无 style 分发）----
+    # ① 折角折线（RoadGenerator v2，§2.8）：不带 style
+    connection=ConnectionSpec(mode="door_to_door", kwargs=dict(
+        width=5, layer=1, seed=7,
+        dense_groups=[[...]],   # 稠密分组（可选）：按大建筑区分组的稠密房间
+        dense_degree=2,         # 稠密每房间连最近 n 个（可选）
+        max_turns=6,            # A* 兜底最大折角（可选）
+    )),
+    # ② 直角路网（RoadStyleGenerator，§2.10/2.11）：style="直角"
+    # connection=ConnectionSpec(mode="door_to_door", kwargs=dict(
+    #     style="直角", density="稀疏", width=5, seed=7,
+    # ))
+    # ③ 弯曲路网（RoadStyleGenerator，§2.10/2.11）：style="弯曲"
+    # connection=ConnectionSpec(mode="door_to_door", kwargs=dict(
+    #     style="弯曲", density="稠密", width=5, seed=7, dense_k=3,
+    # )),
 )
 result = gen.generate(spec)
-print(result)  # {map_id, name, seed, areas, rooms, items, warnings}
+print(result)  # {map_id, name, seed, areas, rooms, items, roads, warnings}
 
 # 方式二：直接用主题预设（带随机性，seed 固定则结果固定）
 res = gen.generate(PRESETS["village"](seed=7))
@@ -697,6 +922,20 @@ res = gen.generate(PRESETS["ufo"](seed=7))
 
 ### MapGenerator（阶段 0 新增）
 - `generate(spec, migrate=True) -> dict`：按 MapSpec 配方生成整张地图（种子化、可复现），返回统计与警告
+  （`{map_id, name, seed, areas, rooms, items, roads, warnings}`；`roads` 含 roads/doors/connected/components）
+
+### RoadGenerator（阶段 2 已落地，见 §2.8）
+- `generate_and_save_roads(map_id, layer=1, width=5, seed=None, dense_room_ids=None, dense_groups=None, dense_degree=2, max_turns=6, only_room_ids=None, astar_max_steps=80000)`：节点图式路网（稠密 + 冗余稠密 + 稀疏 + 子群互联），返回统计
+- 形态：优先更直（直线 → L 形1折 → Z/C 形2折），A* 兜底折角 ≤ `max_turns`；主程序经 `ConnectionSpec.kwargs`（不带 style）透传
+- `find_main_roads(map_id, layer=1)`：每建筑区找**区内主路**（被最多其它路引用的路 = 树的最根节点），返回 `{area_id: road_id}`
+- `generate_inter_area_roads(map_id, layer=1, main_roads=None, width=10, seed=None, max_turns=40, astar_max_steps=1500000)`：**区际折角连接**——从各主路 space 中心接出，路径中心线避障、保存剪建筑格（上级路用下级路的主路）
+
+### RoadStyleGenerator（直角/弯曲，见 §2.10/2.11）
+- 主程序接入：`ConnectionSpec.kwargs` 带 `style="直角"|"弯曲"` 即由 `MapGenerator` 调
+  `connect_area`（在现有房间上开门连路），选项 `density="稠密"|"稀疏"`、`dense_k`（稠密每建筑连最近 n 个，默认 3）
+- 直接调用（demo 方式）：`connect_area(area, doors, style, density, width, rng, dense_k=3)` /
+  `connect_inter_area(areas_info, connected, isolated, width, rng, style="弯曲")` /
+  `finalize_road_walls()` / `render_pdf(...)`；`style`/`density`/`width` 每次传入，路级别不硬编码
 
 ### MapSpec / PRESETS（阶段 0 新增）
 - `MapSpec(name, width, height, layers, seed, areas, interior, connection, decoration)`：地图配方

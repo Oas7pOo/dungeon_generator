@@ -311,13 +311,52 @@ class MapVisualizer:
 
             try:
                 if room_type == "road" and isinstance(vec.get("path"), list) and len(vec["path"]) >= 2:
-                    # 道路矢量：沿拐点（waypoints）画简洁折线（跟着路的形状，非 bbox 矩形）
-                    px = [p[0] + 0.5 for p in vec["path"]]
-                    py = [p[1] + 0.5 for p in vec["path"]]
+                    # 道路矢量：
+                    # - geom.curve = {"type":"bezier","segments":[[P,C1,C2,Q],...]} 分段三次贝塞尔
+                    #   （PS 钢笔工具式矢量曲线）→ 用 matplotlib Path + CURVE4 画**真正的曲线**
+                    # - geom.curve 为点列表（旧格式）→ 画稠密折线；
+                    # - 无 curve → 画 path 折线
                     lw = float(vec.get("width", 5)) * 0.8
-                    ax.plot(px, py, color="blue", linewidth=lw, solid_capstyle="round",
-                            zorder=zorder)
-                    center = vec.get("center", [px[len(px) // 2], py[len(py) // 2]])
+                    curve = vec.get("curve")
+                    if isinstance(curve, dict) and curve.get("type") == "bezier":
+                        segs = curve.get("segments") or []
+                        if segs:
+                            from matplotlib.path import Path as MplPath
+                            verts, codes = [], []
+                            for s in segs:
+                                P, C1, C2, Q = s[0], s[1], s[2], s[3]
+                                if not verts:
+                                    verts.append([P[0] + 0.5, P[1] + 0.5])
+                                    codes.append(MplPath.MOVETO)
+                                verts.append([C1[0] + 0.5, C1[1] + 0.5])
+                                codes.append(MplPath.CURVE4)
+                                verts.append([C2[0] + 0.5, C2[1] + 0.5])
+                                codes.append(MplPath.CURVE4)
+                                verts.append([Q[0] + 0.5, Q[1] + 0.5])
+                                codes.append(MplPath.CURVE4)
+                            mpath = MplPath(verts, codes)
+                            ax.add_patch(patches.PathPatch(
+                                mpath, facecolor="none", edgecolor="blue", linewidth=lw,
+                                capstyle="round", zorder=zorder))
+                            center = vec.get("center", [verts[len(verts) // 2][0], verts[len(verts) // 2][1]])
+                        else:
+                            px = [p[0] + 0.5 for p in vec["path"]]
+                            py = [p[1] + 0.5 for p in vec["path"]]
+                            ax.plot(px, py, color="blue", linewidth=lw, solid_capstyle="round",
+                                    zorder=zorder)
+                            center = vec.get("center", [px[len(px) // 2], py[len(py) // 2]])
+                    elif isinstance(curve, list) and len(curve) >= 2:
+                        px = [p[0] + 0.5 for p in curve]
+                        py = [p[1] + 0.5 for p in curve]
+                        ax.plot(px, py, color="blue", linewidth=lw, solid_capstyle="round",
+                                zorder=zorder)
+                        center = vec.get("center", [px[len(px) // 2], py[len(py) // 2]])
+                    else:
+                        px = [p[0] + 0.5 for p in vec["path"]]
+                        py = [p[1] + 0.5 for p in vec["path"]]
+                        ax.plot(px, py, color="blue", linewidth=lw, solid_capstyle="round",
+                                zorder=zorder)
+                        center = vec.get("center", [px[len(px) // 2], py[len(py) // 2]])
 
                 elif room_type == "circle":
                     radius = vec.get("radius", 0)
