@@ -384,7 +384,10 @@ class BuildingAreaGenerator(ABC):
         max_width = max(min_width, int(max_width))
         max_height = max(min_height, int(max_height))
 
-        if regular_rect and random.random() < 1 / 20:
+        # ``regular_rect`` 是普通矩形房间的默认模式：建筑不应随机成极端
+        # 长条。保留一部分正方形会让聚落的轮廓更自然，也使门更容易落在
+        # 足够长的直墙中央。
+        if regular_rect and random.random() < 1 / 8:
             min_side = max(min_width, min_height)
             max_side = min(max_width, max_height)
             if min_side <= max_side:
@@ -407,22 +410,16 @@ class BuildingAreaGenerator(ABC):
             raise ValueError(f"不支持的分布类型: {dist}")
 
         if regular_rect:
-            aspect_ratio = width / height if height != 0 else 1.0
-            if aspect_ratio > 2.0 or aspect_ratio < 0.5:
-                if dist == "uniform":
-                    if random.random() < 0.5:
-                        height = max(min_height, min(int(width), max_height))
-                    else:
-                        width = max(min_width, min(int(height), max_width))
-                else:
-                    scale_factor = float(np.random.normal(1.0, 0.3))
-                    scale_factor = max(0.5, min(scale_factor, 2.0))
-                    if width > height:
-                        width = max(min_width, min(int(width / scale_factor), max_width))
-                        height = max(min_height, min(int(height * scale_factor), max_height))
-                    else:
-                        width = max(min_width, min(int(width * scale_factor), max_width))
-                        height = max(min_height, min(int(height / scale_factor), max_height))
+            # 明确投影到 1:2--2:1 的可行区间。旧实现只在越界时做一次
+            # 随机缩放，仍可能留下很细的长条；这里让该选项成为可靠约束。
+            # 对默认的 5x5--60x80 范围，这会保证每个矩形的长宽比在
+            # [0.5, 2] 内，同时仍保留指数尺寸分布。
+            height = max(height, int(math.ceil(width / 2.0)))
+            height = min(height, int(2 * width))
+            height = max(min_height, min(height, max_height))
+            width = max(width, int(math.ceil(height / 2.0)))
+            width = min(width, int(2 * height))
+            width = max(min_width, min(width, max_width))
 
         return int(width), int(height)
 

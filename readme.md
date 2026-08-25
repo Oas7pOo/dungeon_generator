@@ -386,8 +386,8 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 
 #### 2.8 已落地的道路实现经验（v2，重要）
 
-> **三套路网的选择（主程序统一入口 = `ConnectionSpec(mode='door_to_door', kwargs={...})`）**：
-> `MapGenerator` 按 kwargs 里**有没有 `style`** 自动分发到两套生成器（机制都在 `src/generators/`，
+> **路网选择（主程序统一入口 = `ConnectionSpec(..., kwargs={...})`）**：
+> `MapGenerator` 按 kwargs 里 `style` / mode 自动分发到对应生成器（机制都在 `src/generators/`，
 > 配方只做配置）：
 >
 > | 想生成 | kwargs 写法 | 走哪个生成器 |
@@ -395,8 +395,11 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 > | **折角折线**（直线→L→Z/C，A* 兜底折角 ≤max_turns） | **不带** `style`：`kwargs=dict(width=5, dense_groups=..., max_turns=6)` | `RoadGenerator` v2（本节的 §2.8） |
 > | **直角路网**（4 向 A* 右角折线） | `kwargs=dict(style="直角", density="稀疏", width=5)` | `RoadStyleGenerator`（§2.10/2.11） |
 > | **弯曲路网**（8 向 A* + 圆角曲线） | `kwargs=dict(style="弯曲", density="稠密", width=5)` | `RoadStyleGenerator`（§2.10/2.11） |
+> | **生长树**（面积加权运输树 + 收缩，5–10 宽） | `mode="fungus", kwargs=dict(min_width=5, max_width=10)`（或 `style="生长树"`） | `RoadStyleGenerator.connect_fungus`（§2.9.1） |
+> | **电路**（道路区域的 OD 运输优化，输出单个 road_region） | `mode="fungus_v2"`（或 `style="电路"`） | `RoadStyleGenerator.connect_fungus_v2`（§2.9.2） |
+> | **真菌**（早期维护成本加权侵蚀 + 深部开洞） | `mode="fungus_v3"`（或 `style="真菌"`） | `RoadStyleGenerator.connect_fungus_v3`（§2.9.3） |
 >
-> 生成脚本（demo）也可绕过配方直接实例化生成器调用；但**主程序按配方生成地图时，三种都
+> 生成脚本（demo）也可绕过配方直接实例化生成器调用；但**主程序按配方生成地图时，各种路网都
 > 通过 `ConnectionSpec.kwargs` 指定**（见 §3 使用方法示例）。
 
 > **折角入口与选项**：`RoadGenerator.generate_and_save_roads(map_id, layer=1, width=5, seed=None,
@@ -519,6 +522,126 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
   风格决定 §2.1 形态组合、分级层数与密度；§2.2 算法模式（door_to_door / trunk_branch / fungus）
   与 §2.3 连通性模式在风格内部可组合选用；验收对照 §2.7。
 
+#### 2.9.1 生长树（原“真菌”，已落地：`test/generate_fungus_road_map.py`）
+
+生长树把每栋建筑看成营养源：默认权重为建筑可用格面积的平方根，也可以传入 `weights={room_id|room_name: weight}` 覆盖。先为每栋建筑选择面向加权聚集中心、且尽量在直边中部的门；建筑本体不可穿越，普通道路段则优先避开其周边空地。对外 style 名称为 `生长树`，兼容程序 mode `fungus`。
+
+建筑本体始终不可穿越，但外扩距离不是硬裁切：真菌 A* 使用连续的邻近建筑势场，离建筑越近代价越高。道路会优先留下空地，在狭窄区域则可完整、平滑地贴近外墙，避免“道路带被截断一半”的视觉缺口。`place_buildings` 复用项目的指数尺寸生成器，默认从 5×5 到 60×80（多数小建筑、少数大建筑）。
+
+骨架先使用加权 Kruskal 近似：候选边按 `距离 / (两端权重乘积)^weight_bias` 排序，选无环边后再由 8 向 A* 收缩到避障最短路径。这里的树边只用于计算运输关系，不会逐边原样铺路：先形成高流量主干，后续终端以 A* 接入最近可行的主干中心线，复用段的需求累积并重新加宽。这是 Steiner 式的收缩，能把走向和端点近似的平行道路合成一条更粗、更低维护成本的道路。随后会评估每条非树边：它缩短的加权运输距离若超过该路维护成本的阈值、且大部分不落入已有道路的 6 格走廊内，才保留为真正的冗余环路。因此结果是有限的**运输网**而非树桩或平行复制。树边按切开后两侧总权重乘积、环边按两端直接需求分配峰值宽度；每条路在门口保持 5 宽、在路径中部平滑渐粗至 5--10 的峰值。该模型是可计算、可复现的 Physarum 近似，而非逐格模拟。
+
+普通矩形房间默认启用 `regular_rect=True`：尺寸仍按指数分布生成（多数小、少数大），但长宽会投影到 1:2--2:1 范围，并以 1/8 概率生成正方形；这让默认建筑群以正常比例的矩形为主。
+
+```python
+connection=ConnectionSpec(mode="fungus", kwargs=dict(
+    min_width=5, max_width=10,  # 默认值；所有道路宽度均落在这个闭区间
+    weight_bias=0.7,            # 权重越高，越优先进入短的运输骨架
+    maintenance_cost=20.0, loop_gain_threshold=1.25, max_cycles=3,
+    # weights={"市场": 3.0, 42: 2.0},  # 可选；不填则自动按建筑面积赋权
+))
+```
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `min_width` / `max_width` | 5 / 10 | 最窄/最宽道路宽度（建议保持 5–10；宽路带半径为 max_width//2） |
+| `weights` | None | 可选 `{room_id\|room_name: 权重}`；不传则按建筑可用格面积的平方根赋权 |
+| `weight_bias` | 0.7 | 骨架选边时两端权重乘积的指数：越大越优先连入短运输骨架 |
+| `maintenance_cost` | 20.0 | 每格冗余道路的维护成本（用于环路取舍） |
+| `loop_gain_threshold` | 1.25 | 保留冗余环的最小"节省运输收益 / 维护成本"比值 |
+| `max_cycles` | max(2, 建筑数//5) | 最多保留的冗余环数量（与主干近于平行的候选会自动舍弃） |
+
+固定验证图为 300 x 400，含圆形建筑、斜矩形建筑、通过 `RoomSubdivider` 实际 BSP 分割为 4 个子房间的 50 x 60 建筑，以及另外 7 栋建筑。运行 `python test/generate_fungus_road_map.py` 会写出数据库与 PDF 到 `test/output/fungus_road_map/`。
+
+#### 2.9.2 电路（原“真菌v2”）：道路区域的 OD 运输优化
+
+`ConnectionSpec(mode="fungus_v2")`（或 `style="电路"`）不再生成“建筑 A 到建筑 B 的道路边”，也不使用最宽/最窄道路参数。它把整块可走道路记作格集合 `R`。若建筑 `i` 有 `A_i` 个可用格，那么每个目标建筑 `j` 接收 `A_i` 人；一对建筑的双向需求就是 `A_i + A_j`。优化目标为：
+
+```text
+area_cost × |R| + Σ(i<j) (A_i + A_j) × d_R(门i, 门j)
+```
+
+其中 `d_R` 是人在实际道路区域内的最短路。实现先生成保证全体可达的区域骨架，再增生那些节省的全部 OD 步行成本大于新增道路面积成本的捷径，最后删除维护价值不足的通道。共享部分只计一次面积；道路交叉和合流在格区域中天然互通。`area_cost` 可显式设置，未设置时会按地图尺度和总人流自动标定；`candidate_degree`（默认 5）限制每栋建筑参与比较的近邻候选，以防网络无意义地变成完全网。
+
+```python
+connection = ConnectionSpec(mode="fungus_v2", kwargs={
+    # "area_cost": 2500,       # 可选：一格道路的维护成本，单位为人步
+    "candidate_degree": 5,
+})
+```
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `area_cost` | 自动标定 | 一格道路面积的维护成本（单位为人步）；标定值 = 总人流 / √(地图宽×高)，可显式覆盖 |
+| `candidate_degree` | 5 | 每栋建筑参与优化的近邻候选数（限制比较量，防止退化成完全图） |
+| `weights` | None | 可选覆盖各建筑格数 A_i（默认用建筑 space 格数；i→j 人流 = A_i，无向需求 = A_i+A_j） |
+
+800 x 800、60 房间压力图可运行 `python test/generate_fungus_v2_mesh_800_map.py`。它复用指数房间尺寸生成，验证 60 个门全部连接到同一个 `road_region`，并把数据库和多层视图 PDF 写到 `test/output/fungus_v2_mesh_800/`。
+
+#### 2.9.3 真菌：早期维护成本加权侵蚀（唯一保留版本）
+
+`ConnectionSpec(mode="fungus_v3")`（或 `style="真菌"`）是项目唯一保留的真菌实现，即早期维护成本加权侵蚀版本。它先把建筑区内所有不含建筑的区域铺满，再把待删除区域看成从地图外缘、建筑边缘或内部种子生长的空洞。主侵蚀结束后，算法会在剩余大块区域深部重新萌发空洞并局部扩孔，使道路继续自然收紧。
+
+```text
+maintenance_cost × 道路面积
++ Σ(i<j) (A_i + A_j) × d_R(门i, 门j)
++ perimeter_cost × 道路边界长度
+```
+
+其中 `A_i` 是建筑 i 的格数，代表 i 向每个其它建筑派出的人数；最后一项是很小的数值正则，只用于抑制栅格锯齿。对每个出发门，算法用 Brandes 依赖回传把需求严格分摊到全部等长最短路，避免旧版任取一条父链所造成的树状方向偏置。每轮根据面积收益、人流敏感度和局部曲率同时移动一批边界格，再以完整 OD 能量做回溯线搜索；候选断路或能量上升时自动折半步长。
+
+`maintenance_cost` 越高，真菌越强烈地缩到高流量区域；越低则保留更多能缩短人流路程的环和捷径。`min_road_width` 默认且最低为 5；优化格只用四邻域连接，所以承担连通性的通道至少包含一个完整 5 格宽单元。大图不再强制使用 10×10 方块，`optimization_cell_size` 默认就是 5。输出仅向外做圆角扩张，不会把最窄通道削细。
+
+```python
+connection = ConnectionSpec(mode="fungus_v3", kwargs={
+    "maintenance_cost": 2600,  # 可选；越高越节省道路面积
+    "min_road_width": 5,
+    "optimization_cell_size": 5,
+    "max_iterations": 48,
+    "max_attempts": 110,
+    "erosion_batch_size": 0,    # 0：按图规模自动选择初始形状步长
+    "perimeter_weight": 0.005,  # 保留自然侵蚀形态，避免过度厚块偏好
+    "nucleation_interval": 4,   # 内部空洞萌发周期
+    "detour_factor": 2.0,       # 越高越不愿牺牲低绕路路径
+    "late_nucleation_rounds": 12,
+    "hole_growth_steps": 8,
+    "hole_growth_batch": 0,     # 0：自动
+    "late_min_solid_depth": 3,
+    "boundary_rounding": 0,
+    "building_clearance": 1,
+})
+```
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `maintenance_cost` | 自动标定 | 每个道路格的维护成本（人步）；标定值 = 总人流 / √(地图宽×高)，越高越强烈收缩到高流量区域 |
+| `min_road_width` | 5 | 最小道路宽度（**不能小于 5**） |
+| `optimization_cell_size` | =min_road_width | 形状求解宏格宽度（默认即 5，不再强制 10） |
+| `max_iterations` | 48 | 侵蚀成功轮次上限（收缩不够深时提高） |
+| `max_attempts` | 110 | 回溯评估次数上限（回溯提前耗尽时提高） |
+| `erosion_batch_size` | 0 | 初始形状步长（0 = 按地图规模/迭代数自动设置） |
+| `perimeter_weight` | 0.005 | 周长正则权重；早期侵蚀版使用较低值保留自然分支形态 |
+| `nucleation_interval` | 4 | 每隔多少轮允许在内部低流量处萌发空洞 |
+| `detour_factor` | 2.0 | 形状导数对人流绕路的敏感度（越高越不愿牺牲低绕路路径） |
+| `late_nucleation_rounds` | 12 | 主侵蚀后寻找深部新空洞的轮数 |
+| `hole_growth_steps` | 8 | 每个深部空洞的局部扩张轮数 |
+| `hole_growth_batch` | 0 | 每次扩孔格数（0 = 自动） |
+| `late_min_solid_depth` | 3 | 新空洞距已有空洞的最小优化格距离 |
+| `boundary_rounding` | 0 | 输出圆角半径；早期侵蚀版默认不额外向外加粗 |
+| `building_clearance` | 1 | 非门位置的建筑退距（路带距建筑 ≥ 该格数） |
+| `weights` | None | 可选覆盖建筑格数 A_i（默认用建筑 space 格数） |
+
+压力脚本 `python test/generate_fungus_v3_mesh_800_map.py` 使用同一套 800 x 800 / 60 房间指数尺寸布局验证门、连通性、面积、OD 路程、接受批大小和空洞萌发统计。需要更深的收缩时提高 `max_iterations`；若回溯提前耗尽，再提高 `max_attempts`。
+
+道路 style 对外名称为：`生长树`、`电路`、`真菌`。其中生长树和电路保持原实现不变；真菌只保留本节的早期维护成本加权侵蚀版。程序化 mode `fungus / fungus_v2 / fungus_v3` 保持不变。
+
+固定建筑参数扫描可运行 `python test/generate_fungus_parameter_sweep_800.py`。脚本生成一套 800 x 800、60 建筑的固定布局（含 1 个圆形和 1 个斜矩形），再复制为九份，以维护强度 0.1--0.9 分别生成 PDF。维护强度定义为：
+
+```text
+实际 maintenance_cost = 生成器自动 maintenance_cost × 维护强度
+```
+
+九份地图会验证建筑哈希、门位置、60 门连通性和特殊建筑数量完全一致，结果写入 `test/output/pdf/fungus_parameter_sweep_800/`。
+
 #### 2.10 视觉直走路网（demo 已落地：`test/generate_vision_road_map.py`）
 > 与 RoadGenerator v2 并列的独立路网 demo：**400x600 地图 + 唯一 400x600 建筑区 + 10 个建筑**，
 > 每个建筑外墙开一个门，用"**出门直走朝建筑群中心 + 视野扩大**"接入路网；
@@ -607,9 +730,9 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 > ))
 > ```
 > 不写 `style` 就是**折角折线**（`RoadGenerator` v2，选项见 §2.8 表格：`dense_groups`/`dense_degree`/`max_turns`）。
-> 三种方式共享同一 `ConnectionSpec` 入口，`MapGenerator` 自动分发；稠密/稀疏在**直角/弯曲**里是
+> 六种方式共享同一 `ConnectionSpec` 入口，`MapGenerator` 自动分发；稠密/稀疏在**直角/弯曲**里是
 > `density` 参数（区内二选一），在**折角**里是分层阶段（稠密= `dense_groups` 分组多连，
-> 稀疏= 全区 MST 恒跑，见 §2.8）。
+> 稀疏= 全区 MST 恒跑，见 §2.8）；**生长树/电路/真菌**分别见 §2.9.1–2.9.3。
 
 - **实现要点（用户修正记录）**：
   - **门外一点必须避开建筑**：旋转矩形/圆形等斜边墙的外向是**对角**方向，用 4 邻检测会把门外一点算进建筑内
@@ -747,7 +870,7 @@ def expand_to_band(path: List[Cell], width: int) -> Tuple[Set[Cell], Set[Cell]]:
 | `generators/room_generator.py` | 每 area 一个房间（圆/多边形），迷宫内墙 | tiles 结构即道路/洞穴/破墙载体；`_tiles_for_polygon` 栅格化可复用 | 使用**全局 random**（不可复现）；room_type 无 road/cave；分割/侵蚀/避水逻辑未接入 |
 | `generators/block_room_generator.py` | Watabou 粗格（scale=10）走廊+房间+门；door gap 挖洞；孔合并；轮廓提取 | **corridor 分支 walker 是"类真菌寻路"原型**；`_grow_room` 是"膨胀接触分割"的单房间原型；`_find_doors` + gap carve 可复用于道路/分割的门；`_cells_to_outer_loop` 轮廓提取 | 粗格尺度固定 10；corridor 未作为独立 road room 落库；门为粗格 key，无跨建筑区语义 |
 | `generators/road_generator.py` | RoadGenerator v2（§2.8）：优先更直折线（直线/L/Z/C）+ A* 兜底（折角≤max_turns）+ 稠密/冗余稠密/稀疏/子群互联四阶段 + 多候选重连 + 门口复用 + 兜底外墙 + 道路矢量折线落库；`find_main_roads` 区内主路识别 + `generate_inter_area_roads` 区际折角连接（主路接出） | 节点图式路网（房间+道路统一并查集）；`ConnectionSpec.kwargs` 透传选项；`MapGenerator._generate_roads` 只做配置与调用 | 连通性模式 mostly/island/孤立未实现；避障只对房间内部格（water/stone 待接 §4.4） |
-| `generators/road_style_generator.py` | RoadStyleGenerator（§2.10/2.11）：建筑区排布/建筑放置/任意形状开门（门外点避障）/4·8 向 A* + 兜底 + BFS/视觉直走/圆角曲线/道路保存/区内·区际连接策略（style 参数化不硬编码） | 直角/弯曲路网的机制本体：demo 脚本直调，或主程序经 `ConnectionSpec.kwargs` 带 `style` 分发（§2.8 选择表） | 区际连接策略仅 demo 直调使用；`style`/`density`/`width` 每次传入（路级别不硬编码） |
+| `generators/road_style_generator.py` | RoadStyleGenerator（§2.9.1--2.11）：建筑区排布/建筑放置/任意形状开门（门外点避障）/4·8 向 A* + 兜底 + BFS/视觉直走/圆角曲线/道路保存/区内·区际连接策略（style 参数化不硬编码）；**生长树**（加权运输树 + 流量定宽 + 冗余环）、**电路**（road_region 面积-OD 优化）、**真菌**（满铺水平集侵蚀） | 直角/弯曲/生长树/电路/真菌五套路网的机制本体：demo 脚本直调，或主程序经 `ConnectionSpec.kwargs` 带 `style`/mode 分发（§2.8 选择表） | 区际连接策略仅 demo 直调使用；`style`/`density`/`width` 每次传入（路级别不硬编码） |
 | `generators/dwellings_core/` | Dwellings.js 迁移：RNG / plan.py（divideArea、mergeCorridors）/ house.py（connectRooms、wallDoors）/ shape.py（Edge、Dir、outline_edges、contour2area）/ specs / tags | **`PlanDivider.divide` = 有机房间分割**；`connect_rooms_js` = 门连接；shape 几何基元库 = 道路/洞穴/破碎的底层工具；`RNG` = 可复现随机 | 局部粗格坐标 + origin 偏移，与细格世界坐标并存，道路/水体生成需统一换算（工具已部分存在） |
 | `generators/dwellings_house_generator.py` | dwellings 输出写 room + door/window/stairs item；edge_key → 世界坐标 | **door item 的 position/edge_key 是道路端点的自然来源**；`_edge_center_world` 坐标换算 | 每个 building_area 独立生成，无跨建筑区概念 |
 | `generators/item_generator.py` | 每房间随机门 + 外墙窗 + 楼梯分组；全局 space 索引 | `save_item` 可直接复用于 water/stone（item_type 扩展）；外墙判定思路可复用于道路边缘检测 | `generate_door_for_room` 是**随机门**（无 edge_key），不能作为道路的确定性端点输入；无 water/stone 生成逻辑 |
@@ -846,6 +969,10 @@ python test/test_road_generator.py      # RoadGenerator v2 单元测试（连通
 python test/test_road_generation.py     # 道路生成端到端脚本（6 房间 + 道路连通核验）
 python test/generate_rect_fill_map.py      # 矩形房间填充地图（旋转矩形先放 + 稀疏/稠密路网，见 §1.8/2.9）
 python test/generate_vision_road_map.py    # 视觉直走路网 demo（贝塞尔曲线路，见 §2.10）
+python test/generate_fungus_road_map.py    # 300x400 生长树（10 栋建筑，宽 5--10，见 §2.9.1）
+python test/generate_fungus_v2_mesh_800_map.py  # 800x800/60 房间 电路压力图（road_region，见 §2.9.2）
+python test/generate_fungus_v3_mesh_800_map.py  # 800x800/60 房间 真菌压力图（早期维护成本侵蚀，见 §2.9.3）
+python test/generate_fungus_parameter_sweep_800.py  # 固定布局 × 维护强度 0.1--0.9 参数扫描（见 §2.9.3）
 python test/generate_mega_vision_road_map.py  # 1200x1200 分区大地图（大中小×直角/弯曲×稠密/稀疏，见 §2.11）
 python test/generate_mega_six_style_map.py    # 1200x1200 六风格测验：6 区×（折角/直角/弯曲 × 稀疏/稠密）+ 区际折角主路连接
 ```
@@ -869,7 +996,7 @@ spec = MapSpec(
         BuildingAreaSpec(generator="circle", count=2, kwargs=dict(radius_range=(4, 7))),
     ],
     interior=InteriorSpec(mode="maze"),
-    # ---- 三种道路任选其一（MapGenerator 按 kwargs 有无 style 分发）----
+    # ---- 道路任选其一（MapGenerator 按 mode/style 分发）----
     # ① 折角折线（RoadGenerator v2，§2.8）：不带 style
     connection=ConnectionSpec(mode="door_to_door", kwargs=dict(
         width=5, layer=1, seed=7,
@@ -884,7 +1011,18 @@ spec = MapSpec(
     # ③ 弯曲路网（RoadStyleGenerator，§2.10/2.11）：style="弯曲"
     # connection=ConnectionSpec(mode="door_to_door", kwargs=dict(
     #     style="弯曲", density="稠密", width=5, seed=7, dense_k=3,
-    # )),
+    # ))
+    # ④ 生长树（RoadStyleGenerator，§2.9.1）：面积权重 + 可变 5--10 宽运输树
+    # connection=ConnectionSpec(mode="fungus", kwargs=dict(
+    #     min_width=5, max_width=10, weight_bias=0.7,
+    # ))
+    # ⑤ 电路（RoadStyleGenerator，§2.9.2）：道路区域 OD 运输优化，输出单个 road_region
+    # connection=ConnectionSpec(mode="fungus_v2", kwargs=dict(candidate_degree=5))
+    # ⑥ 真菌（RoadStyleGenerator，§2.9.3）：早期维护成本侵蚀，输出单个 road_region
+    # connection=ConnectionSpec(mode="fungus_v3", kwargs=dict(
+    #     maintenance_cost=2600, min_road_width=5,
+    #     late_nucleation_rounds=12, hole_growth_steps=8,
+    # ))
 )
 result = gen.generate(spec)
 print(result)  # {map_id, name, seed, areas, rooms, items, roads, warnings}
@@ -930,10 +1068,13 @@ res = gen.generate(PRESETS["ufo"](seed=7))
 - `find_main_roads(map_id, layer=1)`：每建筑区找**区内主路**（被最多其它路引用的路 = 树的最根节点），返回 `{area_id: road_id}`
 - `generate_inter_area_roads(map_id, layer=1, main_roads=None, width=10, seed=None, max_turns=40, astar_max_steps=1500000)`：**区际折角连接**——从各主路 space 中心接出，路径中心线避障、保存剪建筑格（上级路用下级路的主路）
 
-### RoadStyleGenerator（直角/弯曲，见 §2.10/2.11）
+### RoadStyleGenerator（直角/弯曲/生长树/电路/真菌，见 §2.9.1--2.11）
 - 主程序接入：`ConnectionSpec.kwargs` 带 `style="直角"|"弯曲"` 即由 `MapGenerator` 调
   `connect_area`（在现有房间上开门连路），选项 `density="稠密"|"稀疏"`、`dense_k`（稠密每建筑连最近 n 个，默认 3）
 - 直接调用（demo 方式）：`connect_area(area, doors, style, density, width, rng, dense_k=3)` /
+  `make_fungus_doors(buildings, max_width=10)` / `connect_fungus(area, doors, min_width=5, max_width=10, weights=None)` /
+  `connect_fungus_v2(area, doors, area_cost=None, candidate_degree=5, weights=None)` /
+  `connect_fungus_v3(area, doors, maintenance_cost=None, min_road_width=5, ...)` /
   `connect_inter_area(areas_info, connected, isolated, width, rng, style="弯曲")` /
   `finalize_road_walls()` / `render_pdf(...)`；`style`/`density`/`width` 每次传入，路级别不硬编码
 

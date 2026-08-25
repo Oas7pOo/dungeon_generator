@@ -510,20 +510,34 @@ class MapGenerator:
           - none          : 不生成道路
           - door_to_door  : 已实现。kwargs 无 style -> RoadGenerator v2（折角折线，§2.8）；
                            kwargs 有 style         -> RoadStyleGenerator（直角/弯曲 × 稠密/稀疏）
-          - fungus / trunk_branch : 规划中，暂按 door_to_door 生成
+          - fungus                : 生长树（旧真菌：面积权重 + 可变路宽）
+          - fungus_v2             : 电路（旧真菌v2：道路面积 + 全部 OD 最短步行代价）
+          - fungus_v3             : 真菌（早期维护成本加权侵蚀 + 后期深部开洞）
+          - trunk_branch          : 规划中，暂按 door_to_door 生成
         """
         mode = spec.connection.mode
         if mode == "none":
             return {"roads": 0, "connected": True, "components": [], "warnings": []}
 
-        if mode in ("fungus", "trunk_branch"):
-            warnings.append(f"connection.{mode} 规划中，暂按 door_to_door 生成")
-
         # kwargs 透传 RoadGenerator 选项（机制内部化：生成器在 src/，这里只做配置与调用）
         kw = spec.connection.kwargs or {}
         style = kw.get("style")
+        if mode == "fungus_v3" or style == "真菌":
+            return self._generate_roads_fungus_v3(map_id, spec, kw, warnings)
+        if mode == "fungus_v2" or style == "电路":
+            return self._generate_roads_fungus_v2(map_id, spec, kw, warnings)
+        if mode == "fungus" or style == "生长树":
+            return self._generate_roads_fungus(map_id, spec, kw, warnings)
+        if mode == "trunk_branch":
+            warnings.append("connection.trunk_branch 规划中，暂按 door_to_door 生成")
         if style in ("直角", "弯曲"):
             return self._generate_roads_style(map_id, spec, kw, str(style), warnings)
+        if style is not None:
+            warnings.append(f"未知道路 style：{style}")
+            return {"roads": 0, "connected": False, "components": [], "warnings": warnings}
+        if mode not in {"door_to_door", "trunk_branch"}:
+            warnings.append(f"未知道路 mode：{mode}")
+            return {"roads": 0, "connected": False, "components": [], "warnings": warnings}
         return self._generate_roads_polyline(map_id, spec, kw, warnings)
 
     def _generate_roads_polyline(
@@ -635,6 +649,210 @@ class MapGenerator:
             "warnings": [] if all_conn else [f"警告：{len(comps)} 个不连通分量"],
             "style": style,
             "density": density,
+        }
+
+    def _generate_roads_fungus(
+        self,
+        map_id: int,
+        spec: MapSpec,
+        kw: Dict[str, Any],
+        warnings: List[str],
+    ) -> JsonDict:
+        """生长树：建筑面积是默认营养权重，运输骨架按流量扩宽。"""
+        from .road_style_generator import RoadStyleGenerator
+
+        min_width = int(kw.get("min_width", 5))
+        max_width = int(kw.get("max_width", 10))
+        if min_width != 5 or max_width != 10:
+            warnings.append("生长树建议保持 min_width=5、max_width=10；已按调用方配置生成")
+        seed = kw.get("seed")
+        gen = RoadStyleGenerator(self.db, map_id, seed=seed)
+        gen.map_w, gen.map_h = int(spec.width), int(spec.height)
+        rows = self.db.fetch_all(
+            "SELECT id, name, geom_json, tiles_json FROM room WHERE map_id = ? "
+            "AND (room_type IS NULL OR room_type != 'road')",
+            (int(map_id),),
+        ) or []
+        buildings = [
+            {"id": int(r["id"]), "name": str(r.get("name") or f"B{int(r['id'])}"),
+             "center": self._room_center_fast(r)}
+            for r in rows
+        ]
+        if len(buildings) < 2:
+            warnings.append("生长树需要 ≥2 个建筑")
+            return {"roads": 0, "connected": True, "components": [], "warnings": warnings,
+                    "style": "生长树"}
+
+        # 宽 10 的道路带半径为 5；将通常路段保持在建筑外扩 5 格之外，门廊是唯一例外。
+        gen.build_obstacles(buildings, clear_zone=max_width // 2)
+        doors = gen.make_fungus_doors(buildings, max_width=max_width, clear_zone=max_width // 2)
+        door_count = sum(d is not None for d in doors)
+        if door_count < 2:
+            warnings.append("生长树开门失败（<2 个门）")
+            return {"roads": 0, "doors": door_count, "connected": False, "components": [],
+                    "warnings": warnings, "style": "生长树"}
+        area = {"area_id": None, "buildings": buildings, "bbox": (0, 0, gen.map_w, gen.map_h)}
+        n, _ = gen.connect_fungus(
+            area, doors, min_width=min_width, max_width=max_width,
+            weights=kw.get("weights"), weight_bias=float(kw.get("weight_bias", 0.7)),
+            maintenance_cost=float(kw.get("maintenance_cost", 20.0)),
+            loop_gain_threshold=float(kw.get("loop_gain_threshold", 1.25)),
+            max_cycles=(int(kw["max_cycles"]) if kw.get("max_cycles") is not None else None),
+        )
+        gen.finalize_road_walls()
+        comps = gen.compute_components(buildings)
+        connected = len(comps) <= 1
+        return {
+            "roads": n, "doors": door_count, "connected": connected,
+            "components": [{"root": root, "rooms": members} for root, members in comps.items()],
+            "warnings": [] if connected else [f"警告：{len(comps)} 个不连通分量"],
+            "style": "生长树", "min_width": min_width, "max_width": max_width,
+        }
+
+    def _generate_roads_fungus_v2(
+        self,
+        map_id: int,
+        spec: MapSpec,
+        kw: Dict[str, Any],
+        warnings: List[str],
+    ) -> JsonDict:
+        """电路：优化一块道路区域，而非生成带固定宽度的道路边。"""
+        from .road_style_generator import RoadStyleGenerator
+
+        gen = RoadStyleGenerator(self.db, map_id, seed=kw.get("seed"))
+        gen.map_w, gen.map_h = int(spec.width), int(spec.height)
+        rows = self.db.fetch_all(
+            "SELECT id, name, geom_json, tiles_json FROM room WHERE map_id = ? "
+            "AND (room_type IS NULL OR room_type != 'road')",
+            (int(map_id),),
+        ) or []
+        buildings = [
+            {"id": int(r["id"]), "name": str(r.get("name") or f"B{int(r['id'])}"),
+             "center": self._room_center_fast(r)}
+            for r in rows
+        ]
+        if len(buildings) < 2:
+            warnings.append("电路路网需要 ≥2 个建筑")
+            return {"roads": 0, "connected": True, "components": [], "warnings": warnings,
+                    "style": "电路"}
+
+        # v2 的约束只禁止穿过建筑本体；道路靠近建筑是否值得由面积--距离目标
+        # 决定，不再继承 v1 的宽路势场或最小/最大路宽。
+        gen.build_obstacles(buildings, clear_zone=0)
+        cx = sum(b["center"][0] for b in buildings) / len(buildings)
+        cy = sum(b["center"][1] for b in buildings) / len(buildings)
+        doors = [gen.make_door(
+            b, blocked=gen.obstacles, width=1,
+            preferred_direction=(cx - b["center"][0], cy - b["center"][1]),
+        ) for b in buildings]
+        door_count = sum(d is not None for d in doors)
+        if door_count < 2:
+            warnings.append("电路路网开门失败（<2 个门）")
+            return {"roads": 0, "doors": door_count, "connected": False, "components": [],
+                    "warnings": warnings, "style": "电路"}
+        area = {"area_id": None, "buildings": buildings, "bbox": (0, 0, gen.map_w, gen.map_h)}
+        n, area_map = gen.connect_fungus_v2(
+            area, doors,
+            area_cost=(float(kw["area_cost"]) if kw.get("area_cost") is not None else None),
+            candidate_degree=int(kw.get("candidate_degree", 5)),
+            weights=kw.get("weights"),
+        )
+        gen.finalize_road_walls()
+        comps = gen.compute_components(buildings)
+        connected = len(comps) <= 1
+        road_row = self.db.fetch_one(
+            "SELECT other_json FROM room WHERE map_id = ? AND room_type='road' ORDER BY id DESC LIMIT 1",
+            (int(map_id),),
+        )
+        other = json.loads(road_row["other_json"]) if road_row and road_row.get("other_json") else {}
+        return {
+            "roads": n, "doors": door_count, "connected": connected,
+            "components": [{"root": root, "rooms": members} for root, members in comps.items()],
+            "warnings": [] if connected else [f"警告：{len(comps)} 个不连通分量"],
+            "style": "电路", "road_area": other.get("road_area"),
+            "travel_cost": other.get("travel_cost"), "objective": other.get("objective"),
+            "area_cost": other.get("area_cost"), "candidate_degree": other.get("candidate_degree"),
+        }
+
+    def _generate_roads_fungus_v3(
+        self,
+        map_id: int,
+        spec: MapSpec,
+        kw: Dict[str, Any],
+        warnings: List[str],
+    ) -> JsonDict:
+        """真菌：早期维护成本加权侵蚀，并在后期继续深部开洞扩孔。"""
+        from .road_style_generator import RoadStyleGenerator
+
+        gen = RoadStyleGenerator(self.db, map_id, seed=kw.get("seed"))
+        gen.map_w, gen.map_h = int(spec.width), int(spec.height)
+        rows = self.db.fetch_all(
+            "SELECT id, name, geom_json, tiles_json FROM room WHERE map_id = ? "
+            "AND (room_type IS NULL OR room_type != 'road')", (int(map_id),)) or []
+        buildings = [{"id": int(row["id"]), "name": str(row.get("name") or f"B{int(row['id'])}"),
+                      "center": self._room_center_fast(row)} for row in rows]
+        if len(buildings) < 2:
+            warnings.append("真菌路网需要 ≥2 个建筑")
+            return {"roads": 0, "connected": True, "components": [], "warnings": warnings,
+                    "style": "真菌"}
+
+        width = max(5, int(kw.get("min_road_width", 5)))
+        gen.build_obstacles(buildings, clear_zone=0)
+        cx = sum(building["center"][0] for building in buildings) / len(buildings)
+        cy = sum(building["center"][1] for building in buildings) / len(buildings)
+        doors = [gen.make_door(
+            building, blocked=gen.obstacles, width=width,
+            preferred_direction=(cx - building["center"][0], cy - building["center"][1]),
+        ) for building in buildings]
+        door_count = sum(door is not None for door in doors)
+        if door_count < 2:
+            warnings.append("真菌路网开门失败（<2 个门）")
+            return {"roads": 0, "doors": door_count, "connected": False, "components": [],
+                    "warnings": warnings, "style": "真菌"}
+        n, _ = gen.connect_fungus_v3(
+            {"area_id": None, "buildings": buildings, "bbox": (0, 0, gen.map_w, gen.map_h)}, doors,
+            maintenance_cost=(float(kw["maintenance_cost"]) if kw.get("maintenance_cost") is not None else None),
+            min_road_width=width,
+            optimization_cell_size=(int(kw["optimization_cell_size"]) if kw.get("optimization_cell_size") is not None else None),
+            max_iterations=int(kw.get("max_iterations", 48)),
+            max_attempts=int(kw.get("max_attempts", 110)),
+            erosion_batch_size=int(kw.get("erosion_batch_size", 0)),
+            boundary_rounding=int(kw.get("boundary_rounding", 0)),
+            building_clearance=int(kw.get("building_clearance", 1)),
+            perimeter_weight=float(kw.get("perimeter_weight", 0.005)),
+            nucleation_interval=int(kw.get("nucleation_interval", 4)),
+            detour_factor=float(kw.get("detour_factor", 2.0)),
+            late_nucleation_rounds=int(kw.get("late_nucleation_rounds", 12)),
+            hole_growth_steps=int(kw.get("hole_growth_steps", 8)),
+            hole_growth_batch=int(kw.get("hole_growth_batch", 0)),
+            late_min_solid_depth=int(kw.get("late_min_solid_depth", 3)),
+            weights=kw.get("weights"),
+        )
+        gen.finalize_road_walls()
+        comps = gen.compute_components(buildings)
+        connected = len(comps) <= 1
+        road = self.db.fetch_one(
+            "SELECT other_json FROM room WHERE map_id = ? AND room_type='road' ORDER BY id DESC LIMIT 1", (int(map_id),))
+        other = json.loads(road["other_json"]) if road and road.get("other_json") else {}
+        return {
+            "roads": n, "doors": door_count, "connected": connected,
+            "components": [{"root": root, "rooms": members} for root, members in comps.items()],
+            "warnings": [] if connected else [f"警告：{len(comps)} 个不连通分量"],
+            "style": "真菌", "road_area": other.get("road_area"),
+            "travel_cost": other.get("travel_cost"), "objective": other.get("objective"),
+            "maintenance_cost": other.get("maintenance_cost"),
+            "min_road_width": other.get("min_road_width"),
+            "erosion_iterations": other.get("erosion_iterations"),
+            "erosion_attempts": other.get("erosion_attempts"),
+            "initial_macro_cells": other.get("initial_macro_cells"),
+            "final_macro_cells": other.get("final_macro_cells"),
+            "internal_void_seeds": other.get("internal_void_seeds"),
+            "colony_expansions": other.get("colony_expansions"),
+            "late_holes_opened": other.get("late_holes_opened"),
+            "late_growth_cells": other.get("late_growth_cells"),
+            "late_attempts": other.get("late_attempts"),
+            "macro_perimeter": other.get("macro_perimeter"),
+            "accepted_batch_sizes": other.get("accepted_batch_sizes"),
         }
 
     @staticmethod

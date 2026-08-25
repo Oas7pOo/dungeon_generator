@@ -57,7 +57,9 @@ class ConnectionSpec:
     mode:
       - none          : 不生成道路（孤立/单体建筑地图默认）
       - door_to_door  : ✅ 已实现（见 readme §2.8/§2.10/§2.11）
-      - fungus        : 类真菌寻路（规划中，暂按 door_to_door 生成）
+      - fungus        : 生长树（旧真菌；建筑面积为营养权重，路宽按流量取 5--10）
+      - fungus_v2     : 电路（旧真菌v2；道路面积 + 全部建筑对的最短步行总代价）
+      - fungus_v3     : 真菌（早期维护成本加权侵蚀 + 后期深部开洞扩孔）
       - trunk_branch  : 主干道+分干道（规划中，暂按 door_to_door 生成）
     kwargs（透传给 src/ 内的生成器，机制内部化；MapGenerator 按是否有 style 分发）：
 
@@ -76,6 +78,38 @@ class ConnectionSpec:
         - width          : 路宽（默认 5）
         - seed           : 路网种子
         - dense_k        : 稠密时每建筑连最近 n 个（默认 3）
+
+      生长树可用 ``mode="fungus"`` 或 ``style="生长树"``：
+        - min_width / max_width : 最窄/最宽道路（默认并建议 5 / 10）
+        - weights                : 可选 ``{room_id|room_name: 权重}``；不传则按建筑面积平方根
+        - weight_bias            : 权重对骨架选边的影响（默认 0.7）
+        - maintenance_cost       : 每格冗余路的维护成本（默认 20.0）
+        - loop_gain_threshold    : 节省运输收益/维护成本的最小比值（默认 1.25）
+        - max_cycles             : 最多保留多少条冗余环（默认 max(2, 建筑数//5)）；
+                                   与主干近乎平行的候选会在收缩阶段自动舍弃
+
+      电路可用 ``mode="fungus_v2"`` 或 ``style="电路"``：
+        - 不使用 min_width / max_width；道路是一个由可走格组成的区域
+        - 人流：建筑 i 有 A_i 格，则 i→j 为 A_i 人；无向需求为 A_i+A_j
+        - area_cost : 维护一格道路相当于多少“人步”成本；缺省时按地图和总人流自动标定
+        - candidate_degree : 每栋建筑参与优化的近邻候选数（默认 5，防止退化成完全图）
+        - weights : 可选覆盖 A_i；默认使用建筑可用格面积
+
+      真菌可用 ``mode="fungus_v3"`` 或 ``style="真菌"``：
+        - 初态是建筑区内所有可通行区域；空洞按离散水平集/拓扑导数生长
+        - maintenance_cost : 每个道路格的维护成本（单位为人步）；越高收缩越强
+        - min_road_width : 最小道路宽度（默认 5，不能小于 5）
+        - optimization_cell_size : 形状求解格宽，默认等于 min_road_width（即 5）
+        - max_iterations / max_attempts : 侵蚀成功轮次与回溯评估次数上限（默认 48 / 110）
+        - erosion_batch_size : 初始形状步长；0 表示按地图规模/迭代数自动设置
+        - perimeter_weight : 周长正则权重（默认 0.005），越高边界越平滑紧凑
+        - nucleation_interval : 每隔多少轮允许内部低流量处萌发空洞（默认 4）
+        - detour_factor : 形状导数对人流绕路的敏感度（默认 2.0）
+        - late_nucleation_rounds : 主侵蚀后寻找深部新空洞的轮数（默认 12）
+        - hole_growth_steps / hole_growth_batch : 每个深部空洞的扩张轮数/批量（默认 8 / 自动）
+        - late_min_solid_depth : 深部空洞距已有空洞的最小优化格距离（默认 3）
+        - boundary_rounding / building_clearance : 输出圆角半径（默认 0）/非门位置建筑退距
+        - weights : 可选覆盖建筑格数 A_i；默认 i→j 的人流量为 A_i
     """
     mode: str = "none"
     kwargs: Dict[str, Any] = field(default_factory=dict)
